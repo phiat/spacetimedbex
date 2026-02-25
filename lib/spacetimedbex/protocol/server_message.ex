@@ -259,7 +259,7 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
   defp decode_single_table_rows(data) do
     with {:ok, table_name, rest} <- Decoder.decode_string(data),
          {:ok, row_list, rest} <- decode_bsatn_row_list(rest) do
-      {:ok, %{table: table_name, rows: row_list}, rest}
+      {:ok, %{table_name: table_name, rows: row_list}, rest}
     end
   end
 

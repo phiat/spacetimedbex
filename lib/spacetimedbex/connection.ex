@@ -117,10 +117,11 @@ defmodule Spacetimedbex.Connection do
 
   @doc "Get the current connection state."
   def get_state(conn) do
-    WebSockex.cast(conn, {:get_state, self()})
+    ref = make_ref()
+    WebSockex.cast(conn, {:get_state, self(), ref})
 
     receive do
-      {:spacetimedb_state, state} -> state
+      {:spacetimedb_state, ^ref, state} -> state
     after
       5_000 -> {:error, :timeout}
     end
@@ -213,8 +214,8 @@ defmodule Spacetimedbex.Connection do
     {:reply, {:binary, ClientMessage.encode(msg)}, state}
   end
 
-  def handle_cast({:get_state, caller}, state) do
-    send(caller, {:spacetimedb_state, sanitize_state(state)})
+  def handle_cast({:get_state, caller, ref}, state) do
+    send(caller, {:spacetimedb_state, ref, sanitize_state(state)})
     {:ok, state}
   end
 
@@ -224,7 +225,7 @@ defmodule Spacetimedbex.Connection do
       "SpacetimeDB: Disconnected (attempt #{attempt}): #{inspect(reason)}"
     )
 
-    state = %{state | connected: false}
+    state = %{state | connected: false, pending_requests: %{}}
     notify(state, {:disconnected, reason, attempt})
 
     if attempt < 5 do

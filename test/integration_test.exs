@@ -37,8 +37,9 @@ defmodule Spacetimedbex.IntegrationTest do
     assert is_binary(token)
     assert String.length(token) > 0
 
-    WebSockex.cast(conn, {:get_state, self()})
-    assert_receive {:spacetimedb_state, state}, 1_000
+    ref = make_ref()
+    WebSockex.cast(conn, {:get_state, self(), ref})
+    assert_receive {:spacetimedb_state, ^ref, state}, 1_000
     assert state.connected == true
 
     Process.exit(conn, :normal)

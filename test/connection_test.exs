@@ -216,9 +216,10 @@ defmodule Spacetimedbex.ConnectionTest do
         connection_id: <<2::128>>
       }
 
-      assert {:ok, ^state} = Connection.handle_cast({:get_state, self()}, state)
+      ref = make_ref()
+      assert {:ok, ^state} = Connection.handle_cast({:get_state, self(), ref}, state)
 
-      assert_receive {:spacetimedb_state, info}
+      assert_receive {:spacetimedb_state, ^ref, info}
       assert info.host == "localhost:3000"
       assert info.connected == true
       # Token should not be in sanitized state
