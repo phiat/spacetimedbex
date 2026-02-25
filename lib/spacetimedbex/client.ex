@@ -44,8 +44,11 @@ defmodule Spacetimedbex.Client do
   - `on_subscribe_applied(table_name, rows, state)` — called per table when subscription data arrives
   - `on_insert(table_name, row, state)` — called per inserted row
   - `on_delete(table_name, row, state)` — called per deleted row
+  - `on_update(table_name, old_row, new_row, state)` — called when a row with the same PK is deleted then inserted (row replacement)
   - `on_transaction(changes, state)` — called with full transaction; return `{:ok, state, :skip_row_callbacks}` to suppress per-row callbacks
   - `on_reducer_result(request_id, result, state)` — called when a reducer completes
+  - `on_unsubscribe_applied(query_set_id, rows, state)` — called when an unsubscribe completes
+  - `on_query_result(request_id, result, state)` — called with one-off query results
   - `on_disconnect(reason, state)` — called on disconnection
   """
 
@@ -70,8 +73,14 @@ defmodule Spacetimedbex.Client do
   @callback on_subscribe_applied(table_name :: String.t(), rows :: [map()], state) :: {:ok, state}
   @callback on_insert(table_name :: String.t(), row :: map(), state) :: {:ok, state}
   @callback on_delete(table_name :: String.t(), row :: map(), state) :: {:ok, state}
+  @callback on_update(table_name :: String.t(), old_row :: map(), new_row :: map(), state) ::
+              {:ok, state}
   @callback on_transaction(changes, state) :: {:ok, state} | {:ok, state, :skip_row_callbacks}
   @callback on_reducer_result(request_id :: non_neg_integer(), result :: term(), state) ::
+              {:ok, state}
+  @callback on_unsubscribe_applied(query_set_id :: non_neg_integer(), rows :: [map()], state) ::
+              {:ok, state}
+  @callback on_query_result(request_id :: non_neg_integer(), result :: term(), state) ::
               {:ok, state}
   @callback on_disconnect(reason :: term(), state) :: {:ok, state}
 
@@ -80,8 +89,11 @@ defmodule Spacetimedbex.Client do
     on_subscribe_applied: 3,
     on_insert: 3,
     on_delete: 3,
+    on_update: 4,
     on_transaction: 2,
     on_reducer_result: 3,
+    on_unsubscribe_applied: 3,
+    on_query_result: 3,
     on_disconnect: 2
   ]
 
@@ -133,6 +145,16 @@ defmodule Spacetimedbex.Client do
   @doc "Call a reducer with pre-encoded BSATN binary arguments."
   def call_reducer_raw(pid, reducer_name, bsatn_binary) do
     GenServer.call(pid, {:call_reducer_raw, reducer_name, bsatn_binary})
+  end
+
+  @doc "Unsubscribe from a query set by ID. Options: `:send_dropped_rows`."
+  def unsubscribe(pid, query_set_id, opts \\ []) do
+    GenServer.call(pid, {:unsubscribe, query_set_id, opts})
+  end
+
+  @doc "Execute a one-off SQL query via WebSocket."
+  def query(pid, query_string) do
+    GenServer.call(pid, {:one_off_query, query_string})
   end
 
   @doc "Get all rows from a cached table."
@@ -217,6 +239,16 @@ defmodule Spacetimedbex.Client do
             {:reply, err, state}
         end
     end
+  end
+
+  def handle_call({:unsubscribe, query_set_id, opts}, _from, state) do
+    Connection.unsubscribe(state.conn_pid, query_set_id, opts)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:one_off_query, query_string}, _from, state) do
+    Connection.one_off_query(state.conn_pid, query_string)
+    {:reply, :ok, state}
   end
 
   def handle_call({:call_reducer_raw, reducer_name, bsatn_binary}, _from, state) do
@@ -309,6 +341,14 @@ defmodule Spacetimedbex.Client do
     invoke_callback(state, :on_reducer_result, [req_id, result])
   end
 
+  defp handle_spacetimedb_message({:unsubscribe_applied, query_set_id, rows}, state) do
+    invoke_callback(state, :on_unsubscribe_applied, [query_set_id, rows])
+  end
+
+  defp handle_spacetimedb_message({:one_off_query_result, request_id, result}, state) do
+    invoke_callback(state, :on_query_result, [request_id, result])
+  end
+
   defp handle_spacetimedb_message({:disconnected, reason, _attempt}, state) do
     invoke_callback(state, :on_disconnect, [reason])
   end
@@ -356,15 +396,65 @@ defmodule Spacetimedbex.Client do
   defp fire_row_callbacks(state, changes) do
     Enum.reduce(changes, state, fn %{table_name: table_name, inserts: inserts, deletes: deletes},
                                    acc ->
+      pk_names = pk_names_for(acc, table_name)
+      {updates, pure_deletes, pure_inserts} = match_updates(deletes, inserts, pk_names)
+
       acc =
-        Enum.reduce(deletes, acc, fn row, inner_acc ->
+        Enum.reduce(pure_deletes, acc, fn row, inner_acc ->
           invoke_callback(inner_acc, :on_delete, [table_name, row])
         end)
 
-      Enum.reduce(inserts, acc, fn row, inner_acc ->
+      acc =
+        Enum.reduce(updates, acc, fn {old_row, new_row}, inner_acc ->
+          invoke_callback(inner_acc, :on_update, [table_name, old_row, new_row])
+        end)
+
+      Enum.reduce(pure_inserts, acc, fn row, inner_acc ->
         invoke_callback(inner_acc, :on_insert, [table_name, row])
       end)
     end)
+  end
+
+  defp match_updates(deletes, inserts, pk_names) do
+    delete_by_pk =
+      Map.new(deletes, fn row -> {extract_pk_value(row, pk_names), row} end)
+
+    {updates, pure_inserts} =
+      Enum.reduce(inserts, {[], []}, fn row, {upd, ins} ->
+        pk = extract_pk_value(row, pk_names)
+
+        case Map.get(delete_by_pk, pk) do
+          nil -> {upd, [row | ins]}
+          old_row -> {[{old_row, row} | upd], ins}
+        end
+      end)
+
+    matched_pks = MapSet.new(updates, fn {old, _new} -> extract_pk_value(old, pk_names) end)
+
+    pure_deletes =
+      Enum.reject(deletes, fn row ->
+        MapSet.member?(matched_pks, extract_pk_value(row, pk_names))
+      end)
+
+    {Enum.reverse(updates), pure_deletes, Enum.reverse(pure_inserts)}
+  end
+
+  defp pk_names_for(state, table_name) do
+    case Map.get(state.schema.tables, table_name) do
+      nil ->
+        []
+
+      table_def ->
+        Enum.map(table_def.primary_key, fn i ->
+          Enum.at(table_def.columns, i).name
+        end)
+    end
+  end
+
+  defp extract_pk_value(row, [single_pk]), do: Map.get(row, single_pk)
+
+  defp extract_pk_value(row, pk_names) do
+    List.to_tuple(Enum.map(pk_names, &Map.get(row, &1)))
   end
 
   defp invoke_callback(state, callback_name, args) do

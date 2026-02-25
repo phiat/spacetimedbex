@@ -38,6 +38,21 @@ defmodule Spacetimedbex.ClientTest do
       {:ok, state}
     end
 
+    def on_update(table_name, old_row, new_row, state) do
+      send(state.test_pid, {:callback, :on_update, table_name, old_row, new_row})
+      {:ok, state}
+    end
+
+    def on_unsubscribe_applied(query_set_id, rows, state) do
+      send(state.test_pid, {:callback, :on_unsubscribe_applied, query_set_id, rows})
+      {:ok, state}
+    end
+
+    def on_query_result(request_id, result, state) do
+      send(state.test_pid, {:callback, :on_query_result, request_id, result})
+      {:ok, state}
+    end
+
     def on_transaction(changes, state) do
       send(state.test_pid, {:callback, :on_transaction, changes})
 
@@ -95,8 +110,11 @@ defmodule Spacetimedbex.ClientTest do
       assert function_exported?(RecordingClient, :on_subscribe_applied, 3)
       assert function_exported?(RecordingClient, :on_insert, 3)
       assert function_exported?(RecordingClient, :on_delete, 3)
+      assert function_exported?(RecordingClient, :on_update, 4)
       assert function_exported?(RecordingClient, :on_transaction, 2)
       assert function_exported?(RecordingClient, :on_reducer_result, 3)
+      assert function_exported?(RecordingClient, :on_unsubscribe_applied, 3)
+      assert function_exported?(RecordingClient, :on_query_result, 3)
       assert function_exported?(RecordingClient, :on_disconnect, 2)
     end
 
@@ -118,6 +136,8 @@ defmodule Spacetimedbex.ClientTest do
       assert function_exported?(Client, :start_link, 3)
       assert function_exported?(Client, :call_reducer, 3)
       assert function_exported?(Client, :call_reducer_raw, 3)
+      assert function_exported?(Client, :unsubscribe, 3)
+      assert function_exported?(Client, :query, 2)
       assert function_exported?(Client, :get_all, 2)
       assert function_exported?(Client, :find, 3)
       assert function_exported?(Client, :count, 2)
@@ -235,6 +255,116 @@ defmodule Spacetimedbex.ClientTest do
         Client.handle_info({:spacetimedb, {:disconnected, :normal, 0}}, state)
 
       assert_receive {:callback, :on_disconnect, :normal}
+    end
+
+    test "unsubscribe_applied fires callback" do
+      state = build_client_state()
+
+      {:noreply, _new_state} =
+        Client.handle_info({:spacetimedb, {:unsubscribe_applied, 42, []}}, state)
+
+      assert_receive {:callback, :on_unsubscribe_applied, 42, []}
+    end
+
+    test "one_off_query_result fires callback" do
+      state = build_client_state()
+
+      {:noreply, _new_state} =
+        Client.handle_info({:spacetimedb, {:one_off_query_result, 7, {:ok, []}}}, state)
+
+      assert_receive {:callback, :on_query_result, 7, {:ok, []}}
+    end
+
+    test "transaction with PK-matched delete+insert fires on_update" do
+      state = build_client_state()
+      old_row_list = TestSchema.person_row_list(1, "Alice", 30)
+      new_row_list = TestSchema.person_row_list(1, "Alice", 31)
+
+      # Combine into one rows_data for deletes and inserts
+      query_sets = [
+        %{
+          tables: [
+            %{
+              table_name: "person",
+              rows: [
+                {:persistent, %{inserts: new_row_list, deletes: old_row_list}}
+              ]
+            }
+          ]
+        }
+      ]
+
+      {:noreply, _new_state} =
+        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+
+      assert_receive {:callback, :on_transaction, _changes}
+
+      # Should fire on_update, NOT separate on_delete + on_insert
+      assert_receive {:callback, :on_update, "person", %{"id" => 1, "age" => 30},
+                      %{"id" => 1, "age" => 31}}
+
+      refute_receive {:callback, :on_insert, _, _}, 50
+      refute_receive {:callback, :on_delete, _, _}, 50
+    end
+
+    test "transaction with non-matching PKs fires separate insert and delete" do
+      state = build_client_state()
+      delete_row = TestSchema.person_row_list(1, "Alice", 30)
+      insert_row = TestSchema.person_row_list(2, "Bob", 25)
+
+      query_sets = [
+        %{
+          tables: [
+            %{
+              table_name: "person",
+              rows: [
+                {:persistent, %{inserts: insert_row, deletes: delete_row}}
+              ]
+            }
+          ]
+        }
+      ]
+
+      {:noreply, _new_state} =
+        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+
+      assert_receive {:callback, :on_transaction, _}
+      assert_receive {:callback, :on_delete, "person", %{"id" => 1}}
+      assert_receive {:callback, :on_insert, "person", %{"id" => 2}}
+      refute_receive {:callback, :on_update, _, _, _}, 50
+    end
+
+    test "mixed transaction: some updates, some pure inserts/deletes" do
+      state = build_client_state()
+
+      # Use equal-length names so fixed_size row splitting works correctly
+      # Delete id=1 (old), insert id=1 (new) → update
+      # Delete id=2 → pure delete
+      # Insert id=3 → pure insert
+      delete_rows = TestSchema.person_row_list_multi([{1, "Alice", 30}, {2, "Berta", 25}])
+      insert_rows = TestSchema.person_row_list_multi([{1, "Alice", 31}, {3, "Carol", 40}])
+
+      query_sets = [
+        %{
+          tables: [
+            %{
+              table_name: "person",
+              rows: [{:persistent, %{inserts: insert_rows, deletes: delete_rows}}]
+            }
+          ]
+        }
+      ]
+
+      {:noreply, _new_state} =
+        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+
+      assert_receive {:callback, :on_transaction, _}
+      assert_receive {:callback, :on_delete, "person", %{"id" => 2, "name" => "Berta"}}
+
+      assert_receive {:callback, :on_update, "person", %{"id" => 1, "age" => 30},
+                      %{"id" => 1, "age" => 31}}
+
+      assert_receive {:callback, :on_insert, "person", %{"id" => 3, "name" => "Carol"}}
     end
 
     test "unknown message does not crash" do
