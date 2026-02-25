@@ -1,0 +1,14 @@
+SpacetimeDB
+AGENTS.md
+CLAUDE.md
+.beads/
+
+# Elixir/Mix
+/_build/
+/deps/
+*.ez
+*.beam
+spacetimedbex-*.tar
+.elixir_ls/
+
+# mix.lock is committed (reproducible builds)
