@@ -47,7 +47,34 @@ defmodule Spacetimedbex.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "LICENSE"]
+      extras: ["README.md", "LICENSE"],
+      groups_for_modules: [
+        "High-Level API": [
+          Spacetimedbex.Client,
+          Spacetimedbex.Http,
+          Spacetimedbex.Phoenix
+        ],
+        "Cache & Schema": [
+          Spacetimedbex.ClientCache,
+          Spacetimedbex.ClientCache.RowDecoder,
+          Spacetimedbex.Schema
+        ],
+        "WebSocket Protocol": [
+          Spacetimedbex.Connection,
+          Spacetimedbex.Protocol,
+          Spacetimedbex.Protocol.ClientMessage,
+          Spacetimedbex.Protocol.ServerMessage
+        ],
+        "BSATN Codec": [
+          Spacetimedbex.BSATN,
+          Spacetimedbex.BSATN.Encoder,
+          Spacetimedbex.BSATN.Decoder,
+          Spacetimedbex.BSATN.ValueEncoder
+        ],
+        Tooling: [
+          Spacetimedbex.Codegen
+        ]
+      ]
     ]
   end
 end
