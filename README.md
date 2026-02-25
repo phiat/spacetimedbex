@@ -1,9 +1,9 @@
 # Spacetimedbex
 
+[![Hex.pm](https://img.shields.io/hexpm/v/spacetimedbex.svg)](https://hex.pm/packages/spacetimedbex)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/spacetimedbex)
 [![Elixir](https://img.shields.io/badge/elixir-~%3E_1.19-blueviolet)](https://elixir-lang.org)
-[![Hex.pm](https://img.shields.io/badge/hex-not_yet_published-lightgrey)](https://hex.pm)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-171_passing-brightgreen)]()
 
 SpacetimeDB client library for Elixir.
 
@@ -30,10 +30,12 @@ Connects to [SpacetimeDB](https://spacetimedb.com) via the v2 BSATN binary WebSo
 # mix.exs
 def deps do
   [
-    {:spacetimedbex, git: "https://github.com/phiat/spacetimedbex.git"}
+    {:spacetimedbex, "~> 0.1.1"}
   ]
 end
 ```
+
+[Documentation](https://hexdocs.pm/spacetimedbex) | [Hex](https://hex.pm/packages/spacetimedbex) | [GitHub](https://github.com/phiat/spacetimedbex)
 
 ## Quick Start
 
