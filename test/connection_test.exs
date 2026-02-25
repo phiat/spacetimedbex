@@ -254,5 +254,56 @@ defmodule Spacetimedbex.ConnectionTest do
                  state
                )
     end
+
+    test "handle_disconnect gives up when attempt equals max (strict less-than boundary)" do
+      # This test distinguishes `<` from `<=` in the reconnect guard.
+      # With attempt_number: 1 and max_reconnect_attempts: 1, the condition
+      # `1 < 1` is false, so it should give up. If someone changed `<` to `<=`,
+      # this test would fail because `1 <= 1` is true (would reconnect instead).
+      state = %Connection{
+        host: "localhost:3000",
+        database: "test_db",
+        handler: self(),
+        connected: true,
+        max_reconnect_attempts: 1,
+        base_backoff_ms: 10,
+        max_backoff_ms: 50
+      }
+
+      assert {:ok, _state} =
+               Connection.handle_disconnect(
+                 %{reason: :remote, attempt_number: 1},
+                 state
+               )
+
+      assert_receive {:spacetimedb, {:disconnected, :remote, 1}}
+      assert_receive {:spacetimedb, :connection_failed}
+    end
+  end
+
+  describe "handle_frame edge cases" do
+    test "text frame returns {:ok, state} unchanged" do
+      state = %Connection{
+        host: "localhost:3000",
+        database: "test_db",
+        handler: self(),
+        connected: true
+      }
+
+      assert {:ok, ^state} = Connection.handle_frame({:text, "hello"}, state)
+    end
+
+    test "binary frame with valid compression but invalid message tag returns {:ok, state}" do
+      # Compression byte 0x00 (none) followed by 0xFF (invalid server message tag).
+      # decompress succeeds, but decode fails — should log warning and return {:ok, state}.
+      state = %Connection{
+        host: "localhost:3000",
+        database: "test_db",
+        handler: self(),
+        connected: true
+      }
+
+      assert {:ok, ^state} = Connection.handle_frame({:binary, <<0x00, 0xFF>>}, state)
+    end
   end
 end

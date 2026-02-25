@@ -145,7 +145,9 @@ defmodule Spacetimedbex.BSATNTest do
     test "encode sum with tag" do
       payload = Encoder.encode_u32(42)
       encoded = Encoder.encode_sum(3, payload)
-      assert <<3, _::binary>> = encoded
+      assert encoded == <<3>> <> payload
+      assert {:ok, 3, rest} = Decoder.decode_tag(encoded)
+      assert {:ok, 42, <<>>} = Decoder.decode_u32(rest)
     end
   end
 

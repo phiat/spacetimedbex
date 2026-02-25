@@ -89,6 +89,50 @@ defmodule Spacetimedbex.ClientCache.RowDecoderTest do
     end
   end
 
+  describe "decode_row/2 error handling" do
+    test "decode_row with truncated data produces decode_error values" do
+      columns = [
+        %{name: "id", type: :u32},
+        %{name: "name", type: :string},
+        %{name: "age", type: :u32}
+      ]
+
+      # Only provide enough data for the first field (4 bytes for u32), then truncate
+      truncated = <<42, 0, 0, 0>>
+
+      row = RowDecoder.decode_row(truncated, columns)
+      assert row["id"] == 42
+      assert {:decode_error, _reason} = row["name"]
+      assert {:decode_error, _reason} = row["age"]
+    end
+  end
+
+  describe "decode_row_list/2 edge cases" do
+    test "decode_row_list with empty row_offsets returns empty list" do
+      row_list = %{
+        size_hint: {:row_offsets, []},
+        rows_data: <<1, 2, 3, 4>>
+      }
+
+      assert RowDecoder.decode_row_list(row_list, @person_columns) == []
+    end
+
+    test "decode_row_list with non-binary rows_data returns empty list" do
+      assert RowDecoder.decode_row_list(%{size_hint: {:fixed_size, 8}, rows_data: nil}, []) == []
+    end
+
+    test "split_by_offsets with out-of-bounds offset raises ArgumentError" do
+      row_list = %{
+        size_hint: {:row_offsets, [0, 100]},
+        rows_data: <<1, 2, 3, 4>>
+      }
+
+      assert_raise ArgumentError, fn ->
+        RowDecoder.decode_row_list(row_list, [%{name: "x", type: :u32}])
+      end
+    end
+  end
+
   describe "decode_value/2 for complex types" do
     test "decodes option some" do
       data = <<0>> <> Encoder.encode_u32(42)

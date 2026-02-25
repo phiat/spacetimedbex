@@ -46,8 +46,9 @@ defmodule Spacetimedbex.ClientCacheIntegrationTest do
   test "full flow: connect, subscribe, call reducer, cache populates" do
     {:ok, cache} = ClientCache.start_link(host: @host, database: @database, handler: self())
 
-    # Start connection with a handler that feeds events to cache
-    handler = spawn_link(fn -> event_forwarder(cache) end)
+    # Start connection with a handler that feeds events to cache and test process
+    test_pid = self()
+    handler = spawn_link(fn -> event_forwarder(cache, test_pid) end)
 
     {:ok, conn} =
       Connection.start_link(
@@ -57,8 +58,8 @@ defmodule Spacetimedbex.ClientCacheIntegrationTest do
         compression: :none
       )
 
-    # Wait for identity
-    Process.sleep(200)
+    # Wait for identity (replaces flaky Process.sleep(200))
+    assert_receive {:forwarded, {:identity, _, _, _}}, 5_000
 
     # Subscribe to person table
     Connection.subscribe(conn, ["SELECT * FROM person"])
@@ -89,12 +90,13 @@ defmodule Spacetimedbex.ClientCacheIntegrationTest do
     GenServer.stop(cache)
   end
 
-  # Forwards SpacetimeDB events to ClientCache
-  defp event_forwarder(cache) do
+  # Forwards SpacetimeDB events to ClientCache and notifies test process
+  defp event_forwarder(cache, test_pid) do
     receive do
       {:spacetimedb, event} ->
         ClientCache.handle_event(cache, event)
-        event_forwarder(cache)
+        send(test_pid, {:forwarded, event})
+        event_forwarder(cache, test_pid)
     end
   end
 end

@@ -20,6 +20,8 @@ defmodule Spacetimedbex.ProtocolTest do
     end
 
     test "encode Unsubscribe" do
+      alias Spacetimedbex.BSATN.Decoder
+
       msg = %Unsubscribe{
         request_id: 2,
         query_set_id: 100,
@@ -27,20 +29,29 @@ defmodule Spacetimedbex.ProtocolTest do
       }
 
       encoded = ClientMessage.encode(msg)
-      assert <<1, _::binary>> = encoded
+      assert <<1, rest::binary>> = encoded
+      assert {:ok, 2, rest} = Decoder.decode_u32(rest)
+      assert {:ok, 100, rest} = Decoder.decode_u32(rest)
+      assert {:ok, 0, <<>>} = Decoder.decode_u8(rest)
     end
 
     test "encode OneOffQuery" do
+      alias Spacetimedbex.BSATN.Decoder
+
       msg = %OneOffQuery{
         request_id: 3,
         query_string: "SELECT * FROM users WHERE id = 1"
       }
 
       encoded = ClientMessage.encode(msg)
-      assert <<2, _::binary>> = encoded
+      assert <<2, rest::binary>> = encoded
+      assert {:ok, 3, rest} = Decoder.decode_u32(rest)
+      assert {:ok, "SELECT * FROM users WHERE id = 1", <<>>} = Decoder.decode_string(rest)
     end
 
     test "encode CallReducer" do
+      alias Spacetimedbex.BSATN.Decoder
+
       args = Encoder.encode_product([Encoder.encode_string("hello")])
 
       msg = %CallReducer{
@@ -50,7 +61,12 @@ defmodule Spacetimedbex.ProtocolTest do
       }
 
       encoded = ClientMessage.encode(msg)
-      assert <<3, _::binary>> = encoded
+      assert <<3, rest::binary>> = encoded
+      assert {:ok, 4, rest} = Decoder.decode_u32(rest)
+      # flags byte
+      assert {:ok, 0, rest} = Decoder.decode_u8(rest)
+      assert {:ok, "say_hello", rest} = Decoder.decode_string(rest)
+      assert {:ok, ^args, <<>>} = Decoder.decode_bytes(rest)
     end
 
     test "Subscribe encoding is valid BSATN" do
@@ -90,6 +106,10 @@ defmodule Spacetimedbex.ProtocolTest do
 
     test "unknown compression tag" do
       assert {:error, {:unknown_compression, 0xFF}} = ServerMessage.decompress(<<0xFF, 1>>)
+    end
+
+    test "empty frame" do
+      assert {:error, :empty_frame} = ServerMessage.decompress(<<>>)
     end
   end
 
@@ -174,6 +194,71 @@ defmodule Spacetimedbex.ProtocolTest do
 
       assert msg.request_id == 42
       assert {:ok, [%{table_name: "users", rows: %{size_hint: {:fixed_size, 8}}}]} = msg.result
+    end
+
+    test "decode SubscribeApplied" do
+      request_id = Encoder.encode_u32(10)
+      query_set_id = Encoder.encode_u32(20)
+      # Build one SingleTableRows: table_name + BsatnRowList
+      table_name = Encoder.encode_string("players")
+      # BsatnRowList: size_hint = FixedSize(4), rows_data = one 4-byte row
+      size_hint = <<0>> <> Encoder.encode_u16(4)
+      row_data = Encoder.encode_u32(99)
+      rows_data = Encoder.encode_bytes(row_data)
+      # Array of 1 SingleTableRows
+      query_rows = Encoder.encode_u32(1) <> table_name <> size_hint <> rows_data
+
+      bsatn = <<1>> <> request_id <> query_set_id <> query_rows
+
+      assert {:ok, %ServerMessage.SubscribeApplied{} = msg, <<>>} =
+               ServerMessage.decode(bsatn)
+
+      assert msg.request_id == 10
+      assert msg.query_set_id == 20
+      assert [%{table_name: "players", rows: %{size_hint: {:fixed_size, 4}, rows_data: ^row_data}}] = msg.rows
+    end
+
+    test "decode TransactionUpdate" do
+      # TransactionUpdate = array of QuerySetUpdate
+      # QuerySetUpdate = query_set_id(u32) + array of TableUpdate
+      # TableUpdate = table_name(string) + array of TableUpdateRows
+      # TableUpdateRows tag 0 = PersistentTable(inserts BsatnRowList + deletes BsatnRowList)
+      insert_data = <<1, 2, 3, 4>>
+      delete_data = <<5, 6, 7, 8>>
+
+      # BsatnRowList for inserts: FixedSize(4) + bytes
+      inserts_row_list = <<0>> <> Encoder.encode_u16(4) <> Encoder.encode_bytes(insert_data)
+      # BsatnRowList for deletes: FixedSize(4) + bytes
+      deletes_row_list = <<0>> <> Encoder.encode_u16(4) <> Encoder.encode_bytes(delete_data)
+
+      # TableUpdateRows: tag 0 (PersistentTable) + inserts + deletes
+      table_update_rows = <<0>> <> inserts_row_list <> deletes_row_list
+      # Array of 1 TableUpdateRows
+      table_update_rows_array = Encoder.encode_u32(1) <> table_update_rows
+
+      # TableUpdate: table_name + rows array
+      table_update = Encoder.encode_string("scores") <> table_update_rows_array
+      # Array of 1 TableUpdate
+      tables_array = Encoder.encode_u32(1) <> table_update
+
+      # QuerySetUpdate: query_set_id + tables array
+      query_set_update = Encoder.encode_u32(55) <> tables_array
+      # Array of 1 QuerySetUpdate
+      query_sets_array = Encoder.encode_u32(1) <> query_set_update
+
+      bsatn = <<4>> <> query_sets_array
+
+      assert {:ok, %ServerMessage.TransactionUpdate{} = msg, <<>>} =
+               ServerMessage.decode(bsatn)
+
+      assert [%{query_set_id: 55, tables: [table]}] = msg.query_sets
+      assert table.table_name == "scores"
+
+      assert [{:persistent, %{inserts: inserts, deletes: deletes}}] = table.rows
+      assert inserts.size_hint == {:fixed_size, 4}
+      assert inserts.rows_data == insert_data
+      assert deletes.size_hint == {:fixed_size, 4}
+      assert deletes.rows_data == delete_data
     end
 
     test "decode OneOffQueryResult with Err result" do

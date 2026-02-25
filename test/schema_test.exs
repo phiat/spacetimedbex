@@ -97,6 +97,61 @@ defmodule Spacetimedbex.SchemaTest do
     end
   end
 
+  describe "ref type resolution" do
+    test "Ref type in a column is resolved to the referenced product type" do
+      raw = %{
+        "typespace" => %{
+          "types" => [
+            %{
+              "Product" => %{
+                "elements" => [
+                  %{"name" => %{"some" => "x"}, "algebraic_type" => %{"U32" => %{}}},
+                  %{"name" => %{"some" => "y"}, "algebraic_type" => %{"U32" => %{}}}
+                ]
+              }
+            },
+            %{
+              "Product" => %{
+                "elements" => [
+                  %{"name" => %{"some" => "id"}, "algebraic_type" => %{"U64" => %{}}},
+                  %{"name" => %{"some" => "coords"}, "algebraic_type" => %{"Ref" => 0}}
+                ]
+              }
+            }
+          ]
+        },
+        "tables" => [
+          %{
+            "name" => "points",
+            "product_type_ref" => 0,
+            "primary_key" => [0]
+          },
+          %{
+            "name" => "objects",
+            "product_type_ref" => 1,
+            "primary_key" => [0]
+          }
+        ],
+        "reducers" => []
+      }
+
+      schema = Schema.parse(raw)
+
+      # The "points" table columns should be plain u32 types
+      {:ok, point_cols} = Schema.columns_for(schema, "points")
+      assert point_cols == [%{name: "x", type: :u32}, %{name: "y", type: :u32}]
+
+      # The "objects" table has a Ref=>0 column that should be resolved
+      {:ok, obj_cols} = Schema.columns_for(schema, "objects")
+      [id_col, coords_col] = obj_cols
+      assert id_col == %{name: "id", type: :u64}
+
+      # The ref should be resolved to the product type, not left as {:ref, 0}
+      assert coords_col.name == "coords"
+      assert coords_col.type == {:product, [%{name: "x", type: :u32}, %{name: "y", type: :u32}]}
+    end
+  end
+
   describe "algebraic type parsing" do
     test "parses all primitive types" do
       for {json_key, expected} <- [
