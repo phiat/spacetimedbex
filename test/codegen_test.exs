@@ -76,6 +76,22 @@ defmodule Spacetimedbex.CodegenTest do
     test "calls Client.call_reducer with correct args", %{source: source} do
       assert source =~ ~s|Spacetimedbex.Client.call_reducer(client, "add_person"|
     end
+
+    test "zero-arg reducer generates @spec" do
+      schema = %Spacetimedbex.Schema{
+        tables: %{},
+        reducers: %{
+          "click" => %{name: "click", params: []}
+        },
+        typespace: []
+      }
+
+      files = Codegen.generate(schema, "MyApp")
+      {_, source} = Enum.find(files, fn {path, _} -> path =~ "reducers.ex" end)
+
+      assert source =~ "@spec click(GenServer.server()) :: :ok | {:error, term()}"
+      assert source =~ "def click(client)"
+    end
   end
 
   describe "client module" do
@@ -98,6 +114,19 @@ defmodule Spacetimedbex.CodegenTest do
       assert source =~ "# def on_connect"
       assert source =~ "# def on_insert"
     end
+
+    test "uses default database name 'my_database' without opts" do
+      files = Codegen.generate(TestSchema.person_schema(), @base_module)
+      {_, source} = Enum.find(files, fn {path, _} -> path =~ "client.ex" end)
+      assert source =~ ~s|"my_database"|
+    end
+
+    test "uses provided database name from opts" do
+      files = Codegen.generate(TestSchema.person_schema(), @base_module, database: "clickarena")
+      {_, source} = Enum.find(files, fn {path, _} -> path =~ "client.ex" end)
+      assert source =~ ~s|"clickarena"|
+      refute source =~ ~s|"my_database"|
+    end
   end
 
   describe "type mapping" do
@@ -114,6 +143,18 @@ defmodule Spacetimedbex.CodegenTest do
       assert Codegen.type_to_typespec({:array, :u32}) == "[non_neg_integer()]"
       assert Codegen.type_to_typespec({:option, :string}) == "String.t() | nil"
       assert Codegen.type_to_typespec({:product, []}) == "map()"
+    end
+
+    test "identity wrapper product maps to integer()" do
+      identity_type = {:product, [%{name: "__identity__", type: :u256}]}
+      assert Codegen.type_to_typespec(identity_type) == "integer()"
+    end
+
+    test "timestamp wrapper product maps to integer()" do
+      timestamp_type =
+        {:product, [%{name: "__timestamp_micros_since_unix_epoch__", type: :i64}]}
+
+      assert Codegen.type_to_typespec(timestamp_type) == "integer()"
     end
 
     test "unknown types fall back to term()" do

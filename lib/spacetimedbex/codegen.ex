@@ -19,8 +19,8 @@ defmodule Spacetimedbex.Codegen do
 
   Returns `[{relative_path, formatted_source}]`.
   """
-  @spec generate(Schema.t(), String.t()) :: [{String.t(), String.t()}]
-  def generate(%Schema{} = schema, base_module) do
+  @spec generate(Schema.t(), String.t(), keyword()) :: [{String.t(), String.t()}]
+  def generate(%Schema{} = schema, base_module, opts \\ []) do
     table_files =
       Enum.map(schema.tables, fn {table_name, table_def} ->
         module_name = "#{base_module}.Tables.#{to_pascal_case(table_name)}"
@@ -39,9 +39,11 @@ defmodule Spacetimedbex.Codegen do
         []
       end
 
+    database_name = Keyword.get(opts, :database, "my_database")
+
     client_file = [
       {module_to_path(base_module <> ".Client"),
-       generate_client_module(base_module <> ".Client", schema)}
+       generate_client_module(base_module <> ".Client", schema, database_name)}
     ]
 
     table_files ++ reducer_file ++ client_file
@@ -116,6 +118,7 @@ defmodule Spacetimedbex.Codegen do
     if reducer_def.params == [] do
       """
         @doc "Call the `#{reducer_name}` reducer."
+        @spec #{func_name}(GenServer.server()) :: :ok | {:error, term()}
         def #{func_name}(client) do
           Spacetimedbex.Client.call_reducer(client, "#{reducer_name}", %{})
         end
@@ -146,7 +149,7 @@ defmodule Spacetimedbex.Codegen do
 
   # --- Client module ---
 
-  defp generate_client_module(module_name, schema) do
+  defp generate_client_module(module_name, schema, database_name) do
     table_names = schema.tables |> Map.keys() |> Enum.sort()
 
     subscribe_list =
@@ -165,7 +168,7 @@ defmodule Spacetimedbex.Codegen do
       def config do
         %{
           host: System.get_env("SPACETIMEDB_HOST", "localhost:3000"),
-          database: System.get_env("SPACETIMEDB_DATABASE", "my_database"),
+          database: System.get_env("SPACETIMEDB_DATABASE", "#{database_name}"),
           subscriptions: [#{subscribe_list}]
         }
       end
@@ -227,6 +230,11 @@ defmodule Spacetimedbex.Codegen do
   def type_to_typespec(:bytes), do: "binary()"
   def type_to_typespec({:array, inner}), do: "[#{type_to_typespec(inner)}]"
   def type_to_typespec({:option, inner}), do: "#{type_to_typespec(inner)} | nil"
+  def type_to_typespec({:product, [%{name: "__identity__", type: :u256}]}), do: "integer()"
+
+  def type_to_typespec({:product, [%{name: "__timestamp_micros_since_unix_epoch__", type: :i64}]}),
+    do: "integer()"
+
   def type_to_typespec({:product, _}), do: "map()"
   def type_to_typespec({:sum, _}), do: "term()"
   def type_to_typespec(_), do: "term()"

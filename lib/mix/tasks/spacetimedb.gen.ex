@@ -35,7 +35,7 @@ defmodule Mix.Tasks.Spacetimedb.Gen do
 
     case Spacetimedbex.Schema.fetch(host, database) do
       {:ok, schema} ->
-        files = Spacetimedbex.Codegen.generate(schema, base_module)
+        files = Spacetimedbex.Codegen.generate(schema, base_module, database: database)
 
         Enum.each(files, fn {relative_path, content} ->
           full_path = Path.join(output_dir, relative_path)
