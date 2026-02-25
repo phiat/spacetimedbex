@@ -9,7 +9,10 @@ defmodule Spacetimedbex.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       description: "SpacetimeDB client library for Elixir",
-      elixirc_paths: elixirc_paths(Mix.env())
+      elixirc_paths: elixirc_paths(Mix.env()),
+      package: package(),
+      docs: docs(),
+      source_url: "https://github.com/phiat/spacetimedbex"
     ]
   end
 
@@ -29,7 +32,22 @@ defmodule Spacetimedbex.MixProject do
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/phiat/spacetimedbex"}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "LICENSE"]
     ]
   end
 end
