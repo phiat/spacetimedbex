@@ -40,7 +40,8 @@ defmodule Spacetimedbex.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/phiat/spacetimedbex"}
+      links: %{"GitHub" => "https://github.com/phiat/spacetimedbex"},
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
     ]
   end
 
