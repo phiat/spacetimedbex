@@ -39,8 +39,9 @@ defmodule Spacetimedbex.ClientCache do
   Start the client cache.
 
   ## Options
-  - `:host` - SpacetimeDB host (for schema fetch). Required.
-  - `:database` - Database name. Required.
+  - `:host` - SpacetimeDB host (for schema fetch). Required unless `:schema` given.
+  - `:database` - Database name. Required unless `:schema` given.
+  - `:schema` - Optional pre-parsed `%Schema{}`. Skips HTTP fetch when provided.
   - `:handler` - Optional PID to forward `{:cache_event, event}` notifications.
   - `:name` - Optional process name.
   """
@@ -81,11 +82,15 @@ defmodule Spacetimedbex.ClientCache do
 
   @impl true
   def init(opts) do
-    host = Keyword.fetch!(opts, :host)
-    database = Keyword.fetch!(opts, :database)
     handler = Keyword.get(opts, :handler)
 
-    case Schema.fetch(host, database) do
+    schema_result =
+      case Keyword.get(opts, :schema) do
+        %Schema{} = schema -> {:ok, schema}
+        nil -> Schema.fetch(Keyword.fetch!(opts, :host), Keyword.fetch!(opts, :database))
+      end
+
+    case schema_result do
       {:ok, schema} ->
         ets_tables = create_ets_tables(schema)
 

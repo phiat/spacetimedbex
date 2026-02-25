@@ -1,9 +1,6 @@
 defmodule Spacetimedbex.PhoenixTest do
   use ExUnit.Case, async: false
 
-  # Phoenix adapter tests require phoenix_pubsub
-  # These are integration tests since they need a live SpacetimeDB for ClientCache
-
   describe "Phoenix adapter module" do
     test "defines expected functions" do
       assert function_exported?(Spacetimedbex.Phoenix, :start_link, 1)
@@ -26,18 +23,42 @@ defmodule Spacetimedbex.PhoenixTest do
   end
 
   describe "Phoenix PubSub broadcasting" do
-    @describetag :integration
+    setup do
+      pubsub_name = :"test_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub_name})
+      {:ok, pubsub: pubsub_name}
+    end
 
-    # Full integration test: starts PubSub, Phoenix adapter, subscribes to topics,
-    # and verifies broadcasts on insert/delete from SpacetimeDB.
-    # Requires live SpacetimeDB at localhost:3000 with testmodule.
+    test "on_insert broadcasts to table topic", %{pubsub: pubsub} do
+      Phoenix.PubSub.subscribe(pubsub, "spacetimedb:person")
 
-    test "broadcasts insert events to PubSub topic" do
-      # Start PubSub
-      # Start Phoenix adapter
-      # Subscribe to "spacetimedb:person"
-      # Call add_person reducer
-      # Assert receive {:spacetimedb, :insert, "person", %{"name" => ...}}
+      state = %{pubsub: pubsub}
+      row = %{"id" => 1, "name" => "Alice", "age" => 30}
+
+      {:ok, ^state} = Spacetimedbex.Phoenix.on_insert("person", row, state)
+
+      assert_receive {:spacetimedb, :insert, "person", ^row}
+    end
+
+    test "on_delete broadcasts to table topic", %{pubsub: pubsub} do
+      Phoenix.PubSub.subscribe(pubsub, "spacetimedb:person")
+
+      state = %{pubsub: pubsub}
+      row = %{"id" => 2, "name" => "Bob", "age" => 25}
+
+      {:ok, ^state} = Spacetimedbex.Phoenix.on_delete("person", row, state)
+
+      assert_receive {:spacetimedb, :delete, "person", ^row}
+    end
+
+    test "on_reducer_result broadcasts to reducers topic", %{pubsub: pubsub} do
+      Phoenix.PubSub.subscribe(pubsub, "spacetimedb:reducers")
+
+      state = %{pubsub: pubsub}
+
+      {:ok, ^state} = Spacetimedbex.Phoenix.on_reducer_result(42, :ok_empty, state)
+
+      assert_receive {:spacetimedb, :reducer_result, 42, :ok_empty}
     end
   end
 end
