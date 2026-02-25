@@ -12,3 +12,7 @@ spacetimedbex-*.tar
 .elixir_ls/
 
 # mix.lock is committed (reproducible builds)
+
+# Rust test module build artifacts
+test_module/target/
+test_module/Cargo.lock
