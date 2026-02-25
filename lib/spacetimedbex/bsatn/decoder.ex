@@ -68,9 +68,13 @@ defmodule Spacetimedbex.BSATN.Decoder do
   def decode_f64(<<val::little-float-64, rest::binary>>), do: {:ok, val, rest}
   def decode_f64(_), do: {:error, :unexpected_eof}
 
-  @doc "Decode a length-prefixed UTF-8 string."
+  @doc "Decode a length-prefixed UTF-8 string. Validates UTF-8 encoding."
   def decode_string(<<len::little-unsigned-32, data::binary-size(len), rest::binary>>) do
-    {:ok, data, rest}
+    if String.valid?(data) do
+      {:ok, data, rest}
+    else
+      {:error, {:invalid_utf8, byte_size(data)}}
+    end
   end
 
   def decode_string(<<_len::little-unsigned-32, _::binary>>), do: {:error, :unexpected_eof}

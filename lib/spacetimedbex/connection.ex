@@ -46,7 +46,10 @@ defmodule Spacetimedbex.Connection do
     next_request_id: 1,
     next_query_set_id: 1,
     pending_requests: %{},
-    connected: false
+    connected: false,
+    max_reconnect_attempts: 5,
+    base_backoff_ms: 1_000,
+    max_backoff_ms: 10_000
   ]
 
   @type t :: %__MODULE__{}
@@ -64,6 +67,9 @@ defmodule Spacetimedbex.Connection do
   - `:token` - JWT auth token. Optional (server will mint one if omitted).
   - `:handler` - PID to receive `{:spacetimedb, msg}` messages. Required.
   - `:compression` - Compression preference: `:none`, `:gzip`, `:brotli`. Default `:none`.
+  - `:max_reconnect_attempts` - Max reconnection attempts before giving up. Default 5.
+  - `:base_backoff_ms` - Base backoff time in ms (multiplied by attempt). Default 1000.
+  - `:max_backoff_ms` - Maximum backoff time in ms. Default 10000.
   - `:name` - Optional process name registration.
   """
   def start_link(opts) do
@@ -72,6 +78,9 @@ defmodule Spacetimedbex.Connection do
     handler = Keyword.fetch!(opts, :handler)
     token = Keyword.get(opts, :token)
     compression = Keyword.get(opts, :compression, :none)
+    max_attempts = Keyword.get(opts, :max_reconnect_attempts, 5)
+    base_backoff = Keyword.get(opts, :base_backoff_ms, 1_000)
+    max_backoff = Keyword.get(opts, :max_backoff_ms, 10_000)
     name_opt = if opts[:name], do: [name: opts[:name]], else: []
 
     state = %__MODULE__{
@@ -79,7 +88,10 @@ defmodule Spacetimedbex.Connection do
       database: database,
       token: token,
       handler: handler,
-      compression: compression
+      compression: compression,
+      max_reconnect_attempts: max_attempts,
+      base_backoff_ms: base_backoff,
+      max_backoff_ms: max_backoff
     }
 
     url = build_url(host, database, compression)
@@ -228,8 +240,8 @@ defmodule Spacetimedbex.Connection do
     state = %{state | connected: false, pending_requests: %{}}
     notify(state, {:disconnected, reason, attempt})
 
-    if attempt < 5 do
-      backoff = min(1000 * attempt, 10_000)
+    if attempt < state.max_reconnect_attempts do
+      backoff = min(state.base_backoff_ms * attempt, state.max_backoff_ms)
       Process.sleep(backoff)
       {:reconnect, state}
     else

@@ -204,9 +204,9 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
   end
 
   defp decode_variant(5, data) do
-    # OneOffQueryResult - basic decode
-    with {:ok, request_id, rest} <- Decoder.decode_u32(data) do
-      {:ok, %OneOffQueryResult{request_id: request_id, result: rest}, <<>>}
+    with {:ok, request_id, rest} <- Decoder.decode_u32(data),
+         {:ok, result, rest} <- decode_one_off_result(rest) do
+      {:ok, %OneOffQueryResult{request_id: request_id, result: result}, rest}
     end
   end
 
@@ -353,6 +353,22 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
     do: {:error, {:unknown_reducer_outcome_tag, tag}}
 
   defp decode_reducer_outcome(_), do: {:error, :unexpected_eof}
+
+  # OneOffResult: tag 0 = Ok(QueryRows), tag 1 = Err(string)
+  defp decode_one_off_result(<<0, rest::binary>>) do
+    with {:ok, rows, rest} <- decode_query_rows(rest) do
+      {:ok, {:ok, rows}, rest}
+    end
+  end
+
+  defp decode_one_off_result(<<1, rest::binary>>) do
+    with {:ok, msg, rest} <- Decoder.decode_string(rest) do
+      {:ok, {:error, msg}, rest}
+    end
+  end
+
+  defp decode_one_off_result(<<tag, _::binary>>), do: {:error, {:unknown_one_off_result_tag, tag}}
+  defp decode_one_off_result(_), do: {:error, :unexpected_eof}
 
   # ProcedureStatus: tag 0 = Returned(bytes), tag 1 = InternalError(string)
   defp decode_procedure_status(<<0, rest::binary>>) do

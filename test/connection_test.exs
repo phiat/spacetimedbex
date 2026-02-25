@@ -225,5 +225,34 @@ defmodule Spacetimedbex.ConnectionTest do
       # Token should not be in sanitized state
       refute Map.has_key?(info, :token)
     end
+
+    test "handle_disconnect respects configurable max_reconnect_attempts" do
+      state = %Connection{
+        host: "localhost:3000",
+        database: "test_db",
+        handler: self(),
+        connected: true,
+        max_reconnect_attempts: 2,
+        base_backoff_ms: 10,
+        max_backoff_ms: 50
+      }
+
+      # Attempt 1 (< 2) should reconnect
+      assert {:reconnect, new_state} =
+               Connection.handle_disconnect(
+                 %{reason: :remote, attempt_number: 1},
+                 state
+               )
+
+      assert new_state.connected == false
+      assert new_state.pending_requests == %{}
+
+      # Attempt 2 (>= 2) should give up
+      assert {:ok, _state} =
+               Connection.handle_disconnect(
+                 %{reason: :remote, attempt_number: 2},
+                 state
+               )
+    end
   end
 end

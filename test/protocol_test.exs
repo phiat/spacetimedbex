@@ -153,5 +153,41 @@ defmodule Spacetimedbex.ProtocolTest do
       assert msg.request_id == 7
       assert msg.result == {:internal_error, "reducer panicked"}
     end
+
+    test "decode OneOffQueryResult with Ok result" do
+      request_id = Encoder.encode_u32(42)
+      # Result tag 0 = Ok, then QueryRows = array of SingleTableRows
+      # 1 table: table_name "users", rows = BsatnRowList
+      table_name = Encoder.encode_string("users")
+      # BsatnRowList: size_hint = FixedSize(8), rows_data = one 8-byte row
+      size_hint = <<0>> <> Encoder.encode_u16(8)
+      row_data = <<1, 0, 0, 0, 0, 0, 0, 0>>
+      rows_data = Encoder.encode_bytes(row_data)
+      # Array of 1 SingleTableRows
+      tables = Encoder.encode_u32(1) <> table_name <> size_hint <> rows_data
+      result = <<0>> <> tables
+
+      bsatn = <<5>> <> request_id <> result
+
+      assert {:ok, %ServerMessage.OneOffQueryResult{} = msg, <<>>} =
+               ServerMessage.decode(bsatn)
+
+      assert msg.request_id == 42
+      assert {:ok, [%{table_name: "users", rows: %{size_hint: {:fixed_size, 8}}}]} = msg.result
+    end
+
+    test "decode OneOffQueryResult with Err result" do
+      request_id = Encoder.encode_u32(43)
+      error_msg = Encoder.encode_string("table not found")
+      result = <<1>> <> error_msg
+
+      bsatn = <<5>> <> request_id <> result
+
+      assert {:ok, %ServerMessage.OneOffQueryResult{} = msg, <<>>} =
+               ServerMessage.decode(bsatn)
+
+      assert msg.request_id == 43
+      assert msg.result == {:error, "table not found"}
+    end
   end
 end

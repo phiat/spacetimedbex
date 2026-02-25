@@ -106,6 +106,12 @@ defmodule Spacetimedbex.BSATNTest do
       encoded = Encoder.encode_string(str)
       assert {:ok, ^str, <<>>} = Decoder.decode_string(encoded)
     end
+
+    test "invalid UTF-8 returns error" do
+      # 3-byte "string" with invalid UTF-8 sequence
+      invalid = <<3, 0, 0, 0, 0xFF, 0xFE, 0xFD>>
+      assert {:error, {:invalid_utf8, 3}} = Decoder.decode_string(invalid)
+    end
   end
 
   describe "bytes" do
