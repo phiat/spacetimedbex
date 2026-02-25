@@ -28,6 +28,7 @@ defmodule Spacetimedbex.MixProject do
       {:websockex, "~> 0.4"},
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
+      {:phoenix_pubsub, "~> 2.1", optional: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
