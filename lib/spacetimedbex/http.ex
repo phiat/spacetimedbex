@@ -52,17 +52,6 @@ defmodule Spacetimedbex.Http do
     end
   end
 
-  @doc "Associate an email with an identity."
-  def set_email(host, identity, email, token) do
-    url = base_url(host) <> "/identity/#{identity}/set-email?email=#{URI.encode_www_form(email)}"
-
-    case Req.post(url, headers: auth_headers(token)) do
-      {:ok, %{status: status}} when status in 200..204 -> :ok
-      {:ok, %{status: status, body: body}} -> {:error, {:http_error, status, body}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Database management
   # ---------------------------------------------------------------------------
@@ -82,7 +71,7 @@ defmodule Spacetimedbex.Http do
     query = if opts[:clear], do: "?clear=true", else: ""
     url = base_url(host) <> "/database/#{name_or_identity}#{query}"
 
-    case Req.post(url,
+    case Req.put(url,
            body: wasm_binary,
            headers: auth_headers(token) ++ [{"content-type", "application/wasm"}]
          ) do
@@ -208,7 +197,7 @@ defmodule Spacetimedbex.Http do
 
   @doc "Ping the server. Returns `:ok` on success."
   def ping(host) do
-    case Req.get(base_url(host) <> "/../ping") do
+    case Req.get(base_url(host) <> "/ping") do
       {:ok, %{status: 200}} -> :ok
       {:ok, %{status: status, body: body}} -> {:error, {:http_error, status, body}}
       {:error, reason} -> {:error, reason}
