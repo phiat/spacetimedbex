@@ -30,7 +30,7 @@ Connects to [SpacetimeDB](https://spacetimedb.com) via the v2 BSATN binary WebSo
 # mix.exs
 def deps do
   [
-    {:spacetimedbex, "~> 0.1.1"}
+    {:spacetimedbex, "~> 0.1.2"}
   ]
 end
 ```
