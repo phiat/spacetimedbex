@@ -8,7 +8,7 @@ defmodule Spacetimedbex.Codegen do
   ## Generated modules
 
   - `BaseModule.Tables.TableName` — defstruct + `@type t` + `from_row/1` for each table
-  - `BaseModule.Reducers` — typed functions that call `Client.call_reducer`
+  - `BaseModule.Reducers` — typed functions that call `Client.call_reducer` (returning `{:ok, request_id}`)
   - `BaseModule.Client` — `use Spacetimedbex.Client` skeleton with config and stub callbacks
   """
 
@@ -118,7 +118,7 @@ defmodule Spacetimedbex.Codegen do
     if reducer_def.params == [] do
       """
         @doc "Call the `#{reducer_name}` reducer."
-        @spec #{func_name}(GenServer.server()) :: :ok | {:error, term()}
+        @spec #{func_name}(GenServer.server()) :: {:ok, pos_integer()} | {:error, term()}
         def #{func_name}(client) do
           Spacetimedbex.Client.call_reducer(client, "#{reducer_name}", %{})
         end
@@ -139,7 +139,7 @@ defmodule Spacetimedbex.Codegen do
 
       """
         @doc "Call the `#{reducer_name}` reducer."
-        @spec #{func_name}(GenServer.server(), #{type_specs}) :: :ok | {:error, term()}
+        @spec #{func_name}(GenServer.server(), #{type_specs}) :: {:ok, pos_integer()} | {:error, term()}
         def #{func_name}(client, #{param_list}) do
           Spacetimedbex.Client.call_reducer(client, "#{reducer_name}", %{#{args_map}})
         end
@@ -195,6 +195,10 @@ defmodule Spacetimedbex.Codegen do
       #   {:ok, state}
       # end
 
+      # def on_subscription_error(query_set_id, error, state) do
+      #   {:ok, state}
+      # end
+
       # def on_transaction(changes, state) do
       #   {:ok, state}
       # end
@@ -233,16 +237,18 @@ defmodule Spacetimedbex.Codegen do
   def type_to_typespec(:string), do: "String.t()"
   def type_to_typespec(:bytes), do: "binary()"
   def type_to_typespec({:array, inner}), do: "[#{type_to_typespec(inner)}]"
-  def type_to_typespec({:option, inner}), do: "#{type_to_typespec(inner)} | nil"
-  def type_to_typespec({:product, [%{name: "__identity__", type: :u256}]}), do: "integer()"
+  def type_to_typespec({:option, inner}), do: "{:some, #{type_to_typespec(inner)}} | nil"
+  def type_to_typespec(:identity), do: "String.t()"
+  def type_to_typespec(:connection_id), do: "String.t()"
+  def type_to_typespec(:uuid), do: "String.t()"
+  def type_to_typespec(:timestamp), do: "DateTime.t()"
+  def type_to_typespec(:time_duration), do: "Duration.t()"
 
-  def type_to_typespec(
-        {:product, [%{name: "__timestamp_micros_since_unix_epoch__", type: :i64}]}
-      ),
-      do: "integer()"
+  def type_to_typespec({:map, k, v}),
+    do: "%{optional(#{type_to_typespec(k)}) => #{type_to_typespec(v)}}"
 
   def type_to_typespec({:product, _}), do: "map()"
-  def type_to_typespec({:sum, _}), do: "term()"
+  def type_to_typespec({:sum, _}), do: "{String.t(), term()}"
   def type_to_typespec(_), do: "term()"
 
   # --- Naming helpers ---

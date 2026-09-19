@@ -24,8 +24,12 @@ defmodule Spacetimedbex.ConnectionTest do
     test "decodes InitialConnection and updates state" do
       alias Spacetimedbex.BSATN.Encoder
 
-      identity = :crypto.strong_rand_bytes(32)
-      connection_id = :crypto.strong_rand_bytes(16)
+      identity_int = 0xDEAD_BEEF
+      connection_id_int = 0x42
+      identity = <<identity_int::little-256>>
+      connection_id = <<connection_id_int::little-128>>
+      identity_hex = Spacetimedbex.Types.identity_from_int(identity_int)
+      connection_id_hex = Spacetimedbex.Types.connection_id_from_int(connection_id_int)
       token = "test-jwt-token"
 
       bsatn = <<0>> <> identity <> connection_id <> Encoder.encode_string(token)
@@ -40,23 +44,26 @@ defmodule Spacetimedbex.ConnectionTest do
       }
 
       assert {:ok, new_state} = Connection.handle_frame({:binary, frame}, state)
-      assert new_state.identity == identity
-      assert new_state.connection_id == connection_id
+      assert new_state.identity == identity_hex
+      assert String.ends_with?(identity_hex, "deadbeef")
+      assert new_state.connection_id == connection_id_hex
       assert new_state.token == token
 
-      assert_receive {:spacetimedb, {:identity, ^identity, ^connection_id, ^token}}
+      assert_receive {:spacetimedb, {:identity, ^identity_hex, ^connection_id_hex, ^token}}
     end
 
     test "decodes ReducerResult OkEmpty and notifies handler" do
       alias Spacetimedbex.BSATN.Encoder
 
       request_id = 42
-      timestamp = 1_700_000_000_000_000_000
+      # Timestamps are microseconds since the Unix epoch
+      timestamp_us = 1_700_000_000_000_000
+      timestamp = DateTime.from_unix!(timestamp_us, :microsecond)
 
       bsatn =
         <<6>> <>
           Encoder.encode_u32(request_id) <>
-          Encoder.encode_i64(timestamp) <>
+          Encoder.encode_i64(timestamp_us) <>
           <<1>>
 
       frame = <<0x00>> <> bsatn
@@ -146,7 +153,7 @@ defmodule Spacetimedbex.ConnectionTest do
       }
 
       assert {:reply, {:binary, data}, new_state} =
-               Connection.handle_cast({:subscribe, ["SELECT * FROM t"]}, state)
+               Connection.handle_cast({:subscribe, ["SELECT * FROM t"], []}, state)
 
       # Should be tag 0 (Subscribe)
       assert <<0, _::binary>> = data
@@ -167,7 +174,7 @@ defmodule Spacetimedbex.ConnectionTest do
       }
 
       assert {:reply, {:binary, data}, new_state} =
-               Connection.handle_cast({:call_reducer, "do_thing", <<>>}, state)
+               Connection.handle_cast({:call_reducer, "do_thing", <<>>, []}, state)
 
       # Should be tag 3 (CallReducer)
       assert <<3, _::binary>> = data
@@ -184,7 +191,7 @@ defmodule Spacetimedbex.ConnectionTest do
       }
 
       assert {:reply, {:binary, data}, new_state} =
-               Connection.handle_cast({:one_off_query, "SELECT 1"}, state)
+               Connection.handle_cast({:one_off_query, "SELECT 1", []}, state)
 
       assert <<2, _::binary>> = data
       assert new_state.next_request_id == 2
@@ -199,10 +206,34 @@ defmodule Spacetimedbex.ConnectionTest do
       }
 
       assert {:reply, {:binary, data}, new_state} =
-               Connection.handle_cast({:unsubscribe, 5, :default}, state)
+               Connection.handle_cast({:unsubscribe, 5, []}, state)
 
       assert <<1, _::binary>> = data
       assert new_state.next_request_id == 2
+    end
+
+    test "caller-supplied ids are used as-is and leave the counters alone" do
+      state = %Connection{host: "localhost:3000", database: "test_db", handler: self()}
+
+      assert {:reply, {:binary, data}, new_state} =
+               Connection.handle_cast(
+                 {:subscribe, ["SELECT * FROM t"], [request_id: 40, query_set_id: 7]},
+                 state
+               )
+
+      # tag 0, request_id 40, query_set_id 7
+      assert <<0, 40::little-32, 7::little-32, _::binary>> = data
+      assert new_state.next_request_id == 1
+      assert new_state.next_query_set_id == 1
+
+      assert {:reply, {:binary, data}, _} =
+               Connection.handle_cast(
+                 {:unsubscribe, 7, [request_id: 41, send_dropped_rows: true]},
+                 state
+               )
+
+      # tag 1, request_id 41, query_set_id 7, flags SendDroppedRows (1)
+      assert <<1, 41::little-32, 7::little-32, 1>> = data
     end
 
     test "sanitize_state omits the token" do

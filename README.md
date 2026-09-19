@@ -17,8 +17,9 @@ Connects to [SpacetimeDB](https://spacetimedb.com) via the v2 BSATN binary WebSo
 | `Spacetimedbex.Protocol` | v2 client/server message encoding and decoding |
 | `Spacetimedbex.Connection` | WebSocket connection with auto-reconnect and backoff |
 | `Spacetimedbex.Schema` | Schema fetcher and parser (tables, reducers, typespace) |
-| `Spacetimedbex.ClientCache` | ETS-backed local mirror of subscribed tables |
-| `Spacetimedbex.Client` | High-level client with callbacks and auto-encoding |
+| `Spacetimedbex.ClientCache` | Standalone ETS-backed, ref-counted mirror of subscribed tables |
+| `Spacetimedbex.Client` | High-level client with callbacks, auto-encoding, and a built-in cache |
+| `Spacetimedbex.Types` | Identity, ConnectionId, Timestamp, TimeDuration and Uuid conversions |
 | `Spacetimedbex.Http` | HTTP REST client for all v1 API endpoints |
 | `Spacetimedbex.Phoenix` | Phoenix PubSub adapter for broadcasting events |
 | `Spacetimedbex.Codegen` | Code generation from schema |
@@ -30,7 +31,7 @@ Connects to [SpacetimeDB](https://spacetimedb.com) via the v2 BSATN binary WebSo
 # mix.exs
 def deps do
   [
-    {:spacetimedbex, "~> 0.1.2"}
+    {:spacetimedbex, "~> 0.2.0"}
   ]
 end
 ```
@@ -84,18 +85,31 @@ Start it and interact:
 ```elixir
 {:ok, pid} = Spacetimedbex.Client.start_link(MyApp.SpaceClient, %{})
 
-# Call a reducer (auto-encodes args via schema)
-Spacetimedbex.Client.call_reducer(pid, "create_user", %{"name" => "Alice", "age" => 30})
+# Call a reducer (auto-encodes args via schema). The request id matches
+# the request_id later passed to on_reducer_result/3.
+{:ok, request_id} =
+  Spacetimedbex.Client.call_reducer(pid, "create_user", %{"name" => "Alice", "age" => 30})
 
 # Query the local cache
 Spacetimedbex.Client.get_all(pid, "users")
 Spacetimedbex.Client.find(pid, "users", 1)
 
-# One-off SQL query via WebSocket
-Spacetimedbex.Client.query(pid, "SELECT * FROM users WHERE age > 25")
+# One-off SQL query via WebSocket (result arrives in on_query_result/3)
+{:ok, request_id} = Spacetimedbex.Client.query(pid, "SELECT * FROM users WHERE age > 25")
 
-# Unsubscribe from a query set
-Spacetimedbex.Client.unsubscribe(pid, query_set_id)
+# Add and remove subscriptions at runtime
+{:ok, query_set_id} = Spacetimedbex.Client.subscribe(pid, ["SELECT * FROM messages"])
+:ok = Spacetimedbex.Client.unsubscribe(pid, query_set_id)
+```
+
+The `:subscriptions` from `config/0` form query set `1`. Every active query set is re-sent
+after an automatic reconnect with the same id. Rows matched by several queries are
+ref-counted in the cache, so row callbacks fire once per row entering or leaving it.
+
+```elixir
+# List active query sets
+Spacetimedbex.Client.subscriptions(pid)
+#=> %{1 => ["SELECT * FROM users"], 2 => ["SELECT * FROM messages"]}
 ```
 
 ### Client Callbacks
@@ -104,12 +118,13 @@ All callbacks are optional except `config/0`:
 
 | Callback | When it fires |
 |----------|---------------|
-| `on_connect(identity, conn_id, token, state)` | Initial connection established |
+| `on_connect(identity, conn_id, token, state)` | Connection (re)established; `identity`/`conn_id` are hex strings |
 | `on_subscribe_applied(table, rows, state)` | Subscription data arrives |
+| `on_subscription_error(query_set_id, error, state)` | Server rejected or dropped a query set |
 | `on_insert(table, row, state)` | Row inserted (also fires for event-table rows, which are never cached) |
 | `on_delete(table, row, state)` | Row deleted |
 | `on_update(table, old_row, new_row, state)` | Row replaced (same PK deleted + inserted). If not implemented, `on_delete` + `on_insert` fire instead |
-| `on_transaction(changes, state)` | Full transaction — return `{:ok, state, :skip_row_callbacks}` to suppress per-row callbacks |
+| `on_transaction(changes, state)` | Transaction's effective changes — return `{:ok, state, :skip_row_callbacks}` to suppress per-row callbacks |
 | `on_reducer_result(request_id, result, state)` | Reducer completes |
 | `on_unsubscribe_applied(query_set_id, rows, state)` | Unsubscribe completes |
 | `on_query_result(request_id, result, state)` | One-off query result arrives |
@@ -122,6 +137,18 @@ Rows are maps with string keys. Options decode to `{:some, value}` or `nil`; sum
 decode to `{"Variant", payload}` (unit variants have payload `%{}`). When encoding reducer
 arguments, sums also accept `{:Variant, payload}` or a bare `"Variant"`/`:Variant` for unit
 variants; integers are range-checked against their column type.
+
+SpacetimeDB's special types decode to Elixir-friendly values (see `Spacetimedbex.Types`):
+
+| SpacetimeDB | Elixir |
+|-------------|--------|
+| `Identity` | 64-char lowercase hex string — the same form the CLI and HTTP API use |
+| `ConnectionId` | 32-char lowercase hex string |
+| `Timestamp` | `DateTime` (UTC, microsecond precision) |
+| `TimeDuration` | `Duration` |
+| `Uuid` | `"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"` |
+
+Encoding accepts these forms as well as raw integers.
 
 ### Code Generation
 
@@ -205,11 +232,11 @@ Server sends (with 1-byte compression envelope): `InitialConnection`, `Subscribe
 ### OTP Design
 
 ```
-Application
-├── Connection (WebSockex) — WebSocket with auto-reconnect
-├── ClientCache (GenServer) — ETS-backed row storage
-├── Schema — HTTP schema fetch + parse
-└── Client (GenServer) — ties it all together with callbacks
+Client (GenServer) — callbacks, request/query-set ids, owns the ETS row cache
+└── Connection (WebSockex) — WebSocket with auto-reconnect
+
+ClientCache (GenServer) — the same ref-counted cache, for use with a raw Connection
+Schema — HTTP schema fetch + parse
 ```
 
 ## Development

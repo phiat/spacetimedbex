@@ -9,6 +9,8 @@ defmodule Spacetimedbex.Schema do
 
   @schema_version "9"
 
+  alias Spacetimedbex.Types
+
   defstruct [:tables, :reducers, :typespace]
 
   @type algebraic_type ::
@@ -29,9 +31,16 @@ defmodule Spacetimedbex.Schema do
           | :f64
           | :string
           | :bytes
+          | :identity
+          | :connection_id
+          | :timestamp
+          | :time_duration
+          | :uuid
           | {:array, algebraic_type()}
           | {:option, algebraic_type()}
           | {:product, [column()]}
+          | {:sum, [column()]}
+          | {:map, algebraic_type(), algebraic_type()}
           | {:ref, non_neg_integer()}
 
   @type column :: %{name: String.t(), type: algebraic_type()}
@@ -120,15 +129,7 @@ defmodule Spacetimedbex.Schema do
 
   defp parse_typespace(_), do: []
 
-  defp parse_type_def(%{"Product" => %{"elements" => elements}}) do
-    {:product, Enum.map(elements, &parse_element/1)}
-  end
-
-  defp parse_type_def(%{"Sum" => %{"variants" => variants}}) do
-    {:sum, Enum.map(variants, &parse_element/1)}
-  end
-
-  defp parse_type_def(other), do: {:unknown, other}
+  defp parse_type_def(type), do: parse_algebraic_type(type)
 
   defp parse_element(%{"name" => name_wrap, "algebraic_type" => at}) do
     name = unwrap_option(name_wrap)
@@ -230,10 +231,18 @@ defmodule Spacetimedbex.Schema do
   end
 
   defp parse_algebraic_type(%{"Product" => %{"elements" => elements}}) do
-    {:product, Enum.map(elements, &parse_element/1)}
+    elements |> Enum.map(&parse_element/1) |> special_or_product()
   end
 
   defp parse_algebraic_type(other), do: {:unknown, other}
+
+  # Single-field products with a marker name are SpacetimeDB special types
+  # (Identity, Timestamp, ...); see `Spacetimedbex.Types`.
+  defp special_or_product([%{name: name, type: type}] = columns) do
+    Types.special_type(name, type) || {:product, columns}
+  end
+
+  defp special_or_product(columns), do: {:product, columns}
 
   # Recursively resolve {:ref, N} types by inlining from the typespace.
   defp resolve_refs({:ref, idx}, typespace), do: resolve_refs(Enum.at(typespace, idx), typespace)

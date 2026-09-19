@@ -111,7 +111,9 @@ defmodule Spacetimedbex.CodegenTest do
       files = Codegen.generate(schema, "MyApp")
       {_, source} = Enum.find(files, fn {path, _} -> path =~ "reducers.ex" end)
 
-      assert source =~ "@spec click(GenServer.server()) :: :ok | {:error, term()}"
+      assert source =~
+               "@spec click(GenServer.server()) :: {:ok, pos_integer()} | {:error, term()}"
+
       assert source =~ "def click(client)"
     end
   end
@@ -163,20 +165,16 @@ defmodule Spacetimedbex.CodegenTest do
 
     test "compound types" do
       assert Codegen.type_to_typespec({:array, :u32}) == "[non_neg_integer()]"
-      assert Codegen.type_to_typespec({:option, :string}) == "String.t() | nil"
+      assert Codegen.type_to_typespec({:option, :string}) == "{:some, String.t()} | nil"
       assert Codegen.type_to_typespec({:product, []}) == "map()"
     end
 
-    test "identity wrapper product maps to integer()" do
-      identity_type = {:product, [%{name: "__identity__", type: :u256}]}
-      assert Codegen.type_to_typespec(identity_type) == "integer()"
-    end
-
-    test "timestamp wrapper product maps to integer()" do
-      timestamp_type =
-        {:product, [%{name: "__timestamp_micros_since_unix_epoch__", type: :i64}]}
-
-      assert Codegen.type_to_typespec(timestamp_type) == "integer()"
+    test "special types map to their Elixir representations" do
+      assert Codegen.type_to_typespec(:identity) == "String.t()"
+      assert Codegen.type_to_typespec(:connection_id) == "String.t()"
+      assert Codegen.type_to_typespec(:uuid) == "String.t()"
+      assert Codegen.type_to_typespec(:timestamp) == "DateTime.t()"
+      assert Codegen.type_to_typespec(:time_duration) == "Duration.t()"
     end
 
     test "unknown types fall back to term()" do

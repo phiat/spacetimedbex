@@ -115,8 +115,9 @@ defmodule Spacetimedbex.ProtocolTest do
 
   describe "ServerMessage decoding" do
     test "decode InitialConnection" do
-      identity = :crypto.strong_rand_bytes(32)
-      connection_id = :crypto.strong_rand_bytes(16)
+      # Wire values are little-endian; the canonical hex is big-endian.
+      identity = <<0xAB>> <> :binary.copy(<<0>>, 30) <> <<0x01>>
+      connection_id = <<0xCD>> <> :binary.copy(<<0>>, 14) <> <<0x02>>
       token = "eyJhbGciOiJFUzI1NiJ9.test.sig"
 
       encoded_token = Encoder.encode_string(token)
@@ -125,8 +126,8 @@ defmodule Spacetimedbex.ProtocolTest do
       assert {:ok, %ServerMessage.InitialConnection{} = msg, <<>>} =
                ServerMessage.decode(bsatn)
 
-      assert msg.identity == identity
-      assert msg.connection_id == connection_id
+      assert msg.identity == "01" <> String.duplicate("00", 30) <> "ab"
+      assert msg.connection_id == "02" <> String.duplicate("00", 14) <> "cd"
       assert msg.token == token
     end
 
@@ -148,7 +149,7 @@ defmodule Spacetimedbex.ProtocolTest do
 
     test "decode ReducerResult with OkEmpty" do
       request_id = Encoder.encode_u32(99)
-      timestamp = Encoder.encode_i64(1_700_000_000_000_000_000)
+      timestamp = Encoder.encode_i64(1_700_000_000_000_000)
       outcome = <<1>>
 
       bsatn = <<6>> <> request_id <> timestamp <> outcome
@@ -157,6 +158,7 @@ defmodule Spacetimedbex.ProtocolTest do
                ServerMessage.decode(bsatn)
 
       assert msg.request_id == 99
+      assert msg.timestamp == ~U[2023-11-14 22:13:20.000000Z]
       assert msg.result == :ok_empty
     end
 

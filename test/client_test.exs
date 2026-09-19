@@ -4,6 +4,7 @@ defmodule Spacetimedbex.ClientTest do
   alias Spacetimedbex.BSATN.Encoder
   alias Spacetimedbex.Client
   alias Spacetimedbex.ClientCache
+  alias Spacetimedbex.ClientCache.{RowDecoder, Store}
   alias Spacetimedbex.Schema
   alias Spacetimedbex.TestSchema
 
@@ -74,6 +75,11 @@ defmodule Spacetimedbex.ClientTest do
       send(state.test_pid, {:callback, :on_disconnect, reason})
       {:ok, state}
     end
+
+    def on_subscription_error(query_set_id, error, state) do
+      send(state.test_pid, {:callback, :on_subscription_error, query_set_id, error})
+      {:ok, state}
+    end
   end
 
   # --- Callback module without on_update ---
@@ -108,19 +114,30 @@ defmodule Spacetimedbex.ClientTest do
 
   defp build_client_state(opts \\ []) do
     schema = TestSchema.person_schema()
-    {:ok, cache_pid} = ClientCache.start_link(schema: schema)
-
     callback_module = Keyword.get(opts, :callback_module, RecordingClient)
     user_state = Keyword.get(opts, :user_state, %{test_pid: self()})
 
     %Client{
       callback_module: callback_module,
       user_state: user_state,
-      cache_pid: cache_pid,
+      store: Store.new(schema),
       conn_pid: self(),
       schema: schema,
-      config: %{host: "localhost:3000", database: "testmodule", subscriptions: []}
+      config: %{host: "localhost:3000", database: "testmodule", subscriptions: []},
+      connected: Keyword.get(opts, :connected, true)
     }
+  end
+
+  # A real server only deletes rows the client already holds, so put a
+  # transaction's delete rows into the cache first.
+  defp seed(state, query_sets) do
+    changes =
+      state.schema
+      |> RowDecoder.decode_query_sets(query_sets)
+      |> Enum.map(&%{&1 | inserts: &1.deletes, deletes: []})
+
+    Store.apply_changes(state.store, changes)
+    state
   end
 
   describe "Client module defines behaviour" do
@@ -210,7 +227,10 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, _new_state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_transaction, changes}
 
@@ -239,7 +259,10 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, _new_state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_transaction, _changes}
 
@@ -266,7 +289,10 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, _new_state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_transaction, _changes}
       refute_receive {:callback, :on_insert, _, _}, 50
@@ -307,7 +333,7 @@ defmodule Spacetimedbex.ClientTest do
       {:noreply, state} =
         Client.handle_info({:spacetimedb, {:subscribe_applied, 1, table_rows}}, state)
 
-      assert ClientCache.count(state.cache_pid, "person") == 1
+      assert Store.count(state.store, "person") == 1
 
       {:noreply, state} =
         Client.handle_info({:spacetimedb, {:unsubscribe_applied, 1, {:some, table_rows}}}, state)
@@ -315,7 +341,7 @@ defmodule Spacetimedbex.ClientTest do
       assert_receive {:callback, :on_unsubscribe_applied, 1,
                       [%{table_name: "person", rows: [%{"id" => 1}]}]}
 
-      assert ClientCache.count(state.cache_pid, "person") == 0
+      assert Store.count(state.store, "person") == 0
     end
 
     test "event-table rows fire on_insert and are not cached" do
@@ -330,10 +356,13 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_insert, "person", %{"id" => 9}}
-      assert ClientCache.count(state.cache_pid, "person") == 0
+      assert Store.count(state.store, "person") == 0
     end
 
     test "PK update falls back to on_delete + on_insert when on_update is not implemented" do
@@ -357,7 +386,10 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, _state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_delete, "person", %{"age" => 30}}
       assert_receive {:callback, :on_insert, "person", %{"age" => 31}}
@@ -370,12 +402,12 @@ defmodule Spacetimedbex.ClientTest do
       {:noreply, state} =
         Client.handle_info({:spacetimedb, {:subscribe_applied, 1, table_rows}}, state)
 
-      assert ClientCache.count(state.cache_pid, "person") == 1
+      assert Store.count(state.store, "person") == 1
 
       {:noreply, state} =
         Client.handle_info({:spacetimedb, {:disconnected, :remote, 1}}, state)
 
-      assert ClientCache.count(state.cache_pid, "person") == 0
+      assert Store.count(state.store, "person") == 0
     end
 
     test "one_off_query_result fires callback" do
@@ -407,7 +439,10 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, _new_state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_transaction, _changes}
 
@@ -438,7 +473,10 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, _new_state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_transaction, _}
       assert_receive {:callback, :on_delete, "person", %{"id" => 1}}
@@ -468,7 +506,10 @@ defmodule Spacetimedbex.ClientTest do
       ]
 
       {:noreply, _new_state} =
-        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+        Client.handle_info(
+          {:spacetimedb, {:transaction_update, query_sets}},
+          seed(state, query_sets)
+        )
 
       assert_receive {:callback, :on_transaction, _}
       assert_receive {:callback, :on_delete, "person", %{"id" => 2, "name" => "Berta"}}
@@ -488,21 +529,13 @@ defmodule Spacetimedbex.ClientTest do
       assert new_state == state
     end
 
-    test "cache_event is ignored" do
-      state = build_client_state()
-
-      {:noreply, new_state} = Client.handle_info({:cache_event, :subscribe_applied}, state)
-      assert new_state == state
-    end
-
     test "minimal client handles messages without crashing" do
       schema = TestSchema.person_schema()
-      {:ok, cache_pid} = ClientCache.start_link(schema: schema)
 
       state = %Client{
         callback_module: MinimalClient,
         user_state: %{},
-        cache_pid: cache_pid,
+        store: Store.new(schema),
         conn_pid: self(),
         schema: schema,
         config: %{host: "localhost:3000", database: "testmodule", subscriptions: []}
@@ -613,6 +646,175 @@ defmodule Spacetimedbex.ClientTest do
     @tag :integration
     test "call_reducer encodes args from schema" do
       # This would need a live SpacetimeDB, skip in unit tests
+    end
+  end
+
+  describe "request ids and subscriptions" do
+    defp call(state, request) do
+      {:reply, reply, state} = Client.handle_call(request, {self(), make_ref()}, state)
+      {reply, state}
+    end
+
+    defp person(id, name, age), do: TestSchema.person_row_list(id, name, age)
+
+    test "call_reducer returns sequential request ids and passes them to the connection" do
+      state = build_client_state()
+
+      {{:ok, 1}, state} = call(state, {:call_reducer, "add_person", %{name: "A", age: 1}})
+      assert_receive {:"$websockex_cast", {:call_reducer, "add_person", _bsatn, [request_id: 1]}}
+
+      {{:ok, 2}, state} = call(state, {:call_reducer_raw, "add_person", <<>>})
+      {{:ok, 3}, state} = call(state, {:one_off_query, "SELECT * FROM person"})
+      {{:ok, 4}, _state} = call(state, {:call_procedure_raw, "proc", <<>>})
+      assert_receive {:"$websockex_cast", {:one_off_query, _, [request_id: 3]}}
+    end
+
+    test "failed encoding does not consume a request id" do
+      state = build_client_state()
+
+      {{:error, {:unknown_reducer, "nope"}}, state} = call(state, {:call_reducer, "nope", %{}})
+
+      {{:error, {:out_of_range, :u32, -1}}, state} =
+        call(state, {:call_reducer, "add_person", %{name: "A", age: -1}})
+
+      {{:ok, 1}, _} = call(state, {:call_reducer_raw, "add_person", <<>>})
+    end
+
+    test "request ids wrap within u32" do
+      state = %{build_client_state() | next_request_id: 0xFFFF_FFFF}
+      {{:ok, 0xFFFF_FFFF}, state} = call(state, {:call_reducer_raw, "x", <<>>})
+      {{:ok, 1}, _} = call(state, {:call_reducer_raw, "x", <<>>})
+    end
+
+    test "subscribe while connected sends immediately with the returned query set id" do
+      state = build_client_state()
+      {{:ok, 1}, state} = call(state, {:subscribe, ["SELECT * FROM person"]})
+
+      assert_receive {:"$websockex_cast",
+                      {:subscribe, ["SELECT * FROM person"], [query_set_id: 1, request_id: 1]}}
+
+      assert state.subscriptions == %{1 => ["SELECT * FROM person"]}
+    end
+
+    test "subscriptions made while disconnected are sent on connect, and resent after reconnect" do
+      state = build_client_state(connected: false)
+      {{:ok, 1}, state} = call(state, {:subscribe, ["SELECT * FROM person"]})
+      {{:ok, 2}, state} = call(state, {:subscribe, ["SELECT * FROM person WHERE age > 30"]})
+      refute_receive {:"$websockex_cast", _}, 20
+
+      {:noreply, state} = Client.handle_info({:spacetimedb, {:identity, "id", "cid", "t"}}, state)
+      assert_receive {:"$websockex_cast", {:subscribe, _, [query_set_id: 1, request_id: _]}}
+      assert_receive {:"$websockex_cast", {:subscribe, _, [query_set_id: 2, request_id: _]}}
+
+      {:noreply, state} = Client.handle_info({:spacetimedb, {:disconnected, :remote, 1}}, state)
+      refute state.connected
+
+      {:noreply, _} = Client.handle_info({:spacetimedb, {:identity, "id", "cid", "t"}}, state)
+      assert_receive {:"$websockex_cast", {:subscribe, _, [query_set_id: 1, request_id: _]}}
+      assert_receive {:"$websockex_cast", {:subscribe, _, [query_set_id: 2, request_id: _]}}
+    end
+
+    test "unsubscribe validates the query set and requests dropped rows" do
+      state = build_client_state()
+
+      {{:error, :unknown_query_set}, state} =
+        call(state, {:unsubscribe, 9, [send_dropped_rows: true]})
+
+      {{:ok, qs}, state} = call(state, {:subscribe, ["SELECT * FROM person"]})
+      {:ok, state} = call(state, {:unsubscribe, qs, [send_dropped_rows: true]})
+      assert state.subscriptions == %{}
+
+      assert_receive {:"$websockex_cast",
+                      {:unsubscribe, ^qs, [request_id: _, send_dropped_rows: true]}}
+    end
+
+    test "subscription_error deactivates the query set and fires the callback" do
+      state = build_client_state()
+      {{:ok, qs}, state} = call(state, {:subscribe, ["SELECT * FROM nope"]})
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:subscription_error, qs, "no such table"}}, state)
+
+      assert_receive {:callback, :on_subscription_error, ^qs, "no such table"}
+      assert state.subscriptions == %{}
+    end
+
+    test "rows shared by overlapping query sets are ref-counted" do
+      state = build_client_state()
+      alice = person(1, "Alice", 30)
+
+      {:noreply, state} =
+        Client.handle_info(
+          {:spacetimedb, {:subscribe_applied, 1, [%{table_name: "person", rows: alice}]}},
+          state
+        )
+
+      {:noreply, state} =
+        Client.handle_info(
+          {:spacetimedb, {:subscribe_applied, 2, [%{table_name: "person", rows: alice}]}},
+          state
+        )
+
+      assert Store.count(state.store, "person") == 1
+
+      # The same insert reported by both query sets fires on_insert once.
+      bob = person(2, "Bob", 40)
+      empty = %{size_hint: {:fixed_size, 0}, rows_data: <<>>}
+      insert_bob = {:persistent, %{inserts: bob, deletes: empty}}
+
+      both = fn rows ->
+        for qs <- [1, 2], do: %{query_set_id: qs, tables: [%{table_name: "person", rows: [rows]}]}
+      end
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:transaction_update, both.(insert_bob)}}, state)
+
+      assert_receive {:callback, :on_insert, "person", %{"id" => 2}}
+      refute_receive {:callback, :on_insert, "person", %{"id" => 2}}, 20
+
+      # Dropping one overlapping query set keeps shared rows cached.
+      dropped = {:some, [%{table_name: "person", rows: person(1, "Alice", 30)}]}
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:unsubscribe_applied, 1, dropped}}, state)
+
+      assert Store.find(state.store, "person", 1)["name"] == "Alice"
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:unsubscribe_applied, 2, dropped}}, state)
+
+      assert Store.find(state.store, "person", 1) == nil
+      assert Store.count(state.store, "person") == 1
+    end
+
+    test "primary-key index follows updates" do
+      state = build_client_state()
+
+      {:noreply, state} =
+        Client.handle_info(
+          {:spacetimedb,
+           {:subscribe_applied, 1, [%{table_name: "person", rows: person(1, "Alice", 30)}]}},
+          state
+        )
+
+      update = [
+        %{
+          query_set_id: 1,
+          tables: [
+            %{
+              table_name: "person",
+              rows: [
+                {:persistent, %{inserts: person(1, "Alice", 31), deletes: person(1, "Alice", 30)}}
+              ]
+            }
+          ]
+        }
+      ]
+
+      {:noreply, state} = Client.handle_info({:spacetimedb, {:transaction_update, update}}, state)
+      assert_receive {:callback, :on_update, "person", %{"age" => 30}, %{"age" => 31}}
+      assert %{"age" => 31} = Store.find(state.store, "person", 1)
+      assert Store.count(state.store, "person") == 1
     end
   end
 end

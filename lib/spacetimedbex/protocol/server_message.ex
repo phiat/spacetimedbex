@@ -14,6 +14,7 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
   """
 
   alias Spacetimedbex.BSATN.Decoder
+  alias Spacetimedbex.Types
 
   # --- Structs ---
 
@@ -22,8 +23,8 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
     defstruct [:identity, :connection_id, :token]
 
     @type t :: %__MODULE__{
-            identity: binary(),
-            connection_id: binary(),
+            identity: String.t(),
+            connection_id: String.t(),
             token: String.t()
           }
   end
@@ -86,7 +87,7 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
 
     @type t :: %__MODULE__{
             request_id: non_neg_integer(),
-            timestamp: integer(),
+            timestamp: DateTime.t(),
             result: reducer_outcome()
           }
 
@@ -105,6 +106,13 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
   defmodule ProcedureResult do
     @moduledoc false
     defstruct [:status, :timestamp, :total_host_execution_duration, :request_id]
+
+    @type t :: %__MODULE__{
+            status: {:returned, binary()} | {:internal_error, String.t()},
+            timestamp: DateTime.t(),
+            total_host_execution_duration: Duration.t(),
+            request_id: non_neg_integer()
+          }
   end
 
   # --- Compression envelope ---
@@ -212,7 +220,7 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
 
   defp decode_variant(6, data) do
     with {:ok, request_id, rest} <- Decoder.decode_u32(data),
-         {:ok, timestamp, rest} <- Decoder.decode_i64(rest),
+         {:ok, timestamp, rest} <- decode_timestamp(rest),
          {:ok, result, rest} <- decode_reducer_outcome(rest) do
       {:ok,
        %ReducerResult{
@@ -225,8 +233,8 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
 
   defp decode_variant(7, data) do
     with {:ok, status, rest} <- decode_procedure_status(data),
-         {:ok, timestamp, rest} <- Decoder.decode_i64(rest),
-         {:ok, duration, rest} <- Decoder.decode_i64(rest),
+         {:ok, timestamp, rest} <- decode_timestamp(rest),
+         {:ok, duration, rest} <- decode_duration(rest),
          {:ok, request_id, rest} <- Decoder.decode_u32(rest) do
       {:ok,
        %ProcedureResult{
@@ -242,13 +250,20 @@ defmodule Spacetimedbex.Protocol.ServerMessage do
 
   # --- Helpers ---
 
-  # Identity is a u256 (32 bytes)
-  defp decode_identity(<<val::binary-size(32), rest::binary>>), do: {:ok, val, rest}
-  defp decode_identity(_), do: {:error, :unexpected_eof}
+  # Identity (u256) and ConnectionId (u128) decode to hex strings; Timestamp and
+  # TimeDuration (i64 microseconds) to DateTime and Duration. See Spacetimedbex.Types.
+  defp decode_identity(data), do: map_ok(Decoder.decode_u256(data), &Types.identity_from_int/1)
 
-  # ConnectionId is a u128 (16 bytes)
-  defp decode_connection_id(<<val::binary-size(16), rest::binary>>), do: {:ok, val, rest}
-  defp decode_connection_id(_), do: {:error, :unexpected_eof}
+  defp decode_connection_id(data),
+    do: map_ok(Decoder.decode_u128(data), &Types.connection_id_from_int/1)
+
+  defp decode_timestamp(data),
+    do: map_ok(Decoder.decode_i64(data), &Types.timestamp_from_micros/1)
+
+  defp decode_duration(data), do: map_ok(Decoder.decode_i64(data), &Types.duration_from_micros/1)
+
+  defp map_ok({:ok, value, rest}, fun), do: {:ok, fun.(value), rest}
+  defp map_ok(error, _fun), do: error
 
   # QueryRows = { tables: [SingleTableRows] }
   defp decode_query_rows(data) do

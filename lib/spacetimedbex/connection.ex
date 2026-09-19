@@ -125,27 +125,33 @@ defmodule Spacetimedbex.Connection do
     WebSockex.start_link(url, __MODULE__, state, ws_opts)
   end
 
-  @doc "Subscribe to one or more SQL queries. Returns the query_set_id."
-  def subscribe(conn, query_strings) when is_list(query_strings) do
-    WebSockex.cast(conn, {:subscribe, query_strings})
+  # All sending functions accept `request_id:` (and `subscribe/3` also
+  # `query_set_id:`) to use caller-chosen ids, as `Spacetimedbex.Client` does.
+  # Omitted ids are allocated from this connection's own counters.
+
+  @doc """
+  Subscribe to one or more SQL queries as a query set.
+
+  Pass `query_set_id:` to choose the id; otherwise one is allocated and
+  reported to the handler as `{:subscribe_sent, query_set_id, request_id}`.
+  """
+  def subscribe(conn, query_strings, opts \\ []) when is_list(query_strings) do
+    WebSockex.cast(conn, {:subscribe, query_strings, opts})
   end
 
-  @doc "Unsubscribe from a query set."
+  @doc "Unsubscribe from a query set. Options: `:send_dropped_rows` (default `false`), `:request_id`."
   def unsubscribe(conn, query_set_id, opts \\ []) do
-    flags =
-      if Keyword.get(opts, :send_dropped_rows, false), do: :send_dropped_rows, else: :default
-
-    WebSockex.cast(conn, {:unsubscribe, query_set_id, flags})
+    WebSockex.cast(conn, {:unsubscribe, query_set_id, opts})
   end
 
   @doc "Execute a one-off SQL query."
-  def one_off_query(conn, query_string) do
-    WebSockex.cast(conn, {:one_off_query, query_string})
+  def one_off_query(conn, query_string, opts \\ []) do
+    WebSockex.cast(conn, {:one_off_query, query_string, opts})
   end
 
   @doc "Call a reducer with BSATN-encoded arguments."
-  def call_reducer(conn, reducer_name, args_bsatn \\ <<>>) do
-    WebSockex.cast(conn, {:call_reducer, reducer_name, args_bsatn})
+  def call_reducer(conn, reducer_name, args_bsatn \\ <<>>, opts \\ []) do
+    WebSockex.cast(conn, {:call_reducer, reducer_name, args_bsatn, opts})
   end
 
   @doc """
@@ -153,8 +159,8 @@ defmodule Spacetimedbex.Connection do
   `{:spacetimedb, {:procedure_result, request_id, status}}` where status is
   `{:returned, bsatn_binary}` or `{:internal_error, message}`.
   """
-  def call_procedure(conn, procedure_name, args_bsatn \\ <<>>) do
-    WebSockex.cast(conn, {:call_procedure, procedure_name, args_bsatn})
+  def call_procedure(conn, procedure_name, args_bsatn \\ <<>>, opts \\ []) do
+    WebSockex.cast(conn, {:call_procedure, procedure_name, args_bsatn, opts})
   end
 
   @doc "Get the current connection state."
@@ -198,9 +204,9 @@ defmodule Spacetimedbex.Connection do
   end
 
   @impl true
-  def handle_cast({:subscribe, query_strings}, state) do
-    {request_id, state} = next_request_id(state)
-    {query_set_id, state} = next_query_set_id(state)
+  def handle_cast({:subscribe, query_strings, opts}, state) do
+    {request_id, state} = take_request_id(state, opts)
+    {query_set_id, state} = take_query_set_id(state, opts)
 
     msg = %Subscribe{
       request_id: request_id,
@@ -213,46 +219,30 @@ defmodule Spacetimedbex.Connection do
     {:reply, {:binary, ClientMessage.encode(msg)}, state}
   end
 
-  def handle_cast({:unsubscribe, query_set_id, flags}, state) do
-    {request_id, state} = next_request_id(state)
-
-    msg = %Unsubscribe{
-      request_id: request_id,
-      query_set_id: query_set_id,
-      flags: flags
-    }
-
+  def handle_cast({:unsubscribe, query_set_id, opts}, state) do
+    {request_id, state} = take_request_id(state, opts)
+    flags = if opts[:send_dropped_rows], do: :send_dropped_rows, else: :default
+    msg = %Unsubscribe{request_id: request_id, query_set_id: query_set_id, flags: flags}
     state = track_request(state, request_id, {:unsubscribe, query_set_id})
     {:reply, {:binary, ClientMessage.encode(msg)}, state}
   end
 
-  def handle_cast({:one_off_query, query_string}, state) do
-    {request_id, state} = next_request_id(state)
-
-    msg = %OneOffQuery{
-      request_id: request_id,
-      query_string: query_string
-    }
-
+  def handle_cast({:one_off_query, query_string, opts}, state) do
+    {request_id, state} = take_request_id(state, opts)
+    msg = %OneOffQuery{request_id: request_id, query_string: query_string}
     state = track_request(state, request_id, {:one_off_query, query_string})
     {:reply, {:binary, ClientMessage.encode(msg)}, state}
   end
 
-  def handle_cast({:call_reducer, reducer_name, args_bsatn}, state) do
-    {request_id, state} = next_request_id(state)
-
-    msg = %CallReducer{
-      request_id: request_id,
-      reducer: reducer_name,
-      args: args_bsatn
-    }
-
+  def handle_cast({:call_reducer, reducer_name, args_bsatn, opts}, state) do
+    {request_id, state} = take_request_id(state, opts)
+    msg = %CallReducer{request_id: request_id, reducer: reducer_name, args: args_bsatn}
     state = track_request(state, request_id, {:call_reducer, reducer_name})
     {:reply, {:binary, ClientMessage.encode(msg)}, state}
   end
 
-  def handle_cast({:call_procedure, procedure_name, args_bsatn}, state) do
-    {request_id, state} = next_request_id(state)
+  def handle_cast({:call_procedure, procedure_name, args_bsatn, opts}, state) do
+    {request_id, state} = take_request_id(state, opts)
     msg = %CallProcedure{request_id: request_id, procedure: procedure_name, args: args_bsatn}
     state = track_request(state, request_id, {:call_procedure, procedure_name})
     {:reply, {:binary, ClientMessage.encode(msg)}, state}
@@ -356,12 +346,18 @@ defmodule Spacetimedbex.Connection do
     state
   end
 
-  defp next_request_id(%{next_request_id: id} = state) do
-    {id, %{state | next_request_id: id + 1}}
+  defp take_request_id(state, opts) do
+    case opts[:request_id] do
+      nil -> {state.next_request_id, %{state | next_request_id: state.next_request_id + 1}}
+      id -> {id, state}
+    end
   end
 
-  defp next_query_set_id(%{next_query_set_id: id} = state) do
-    {id, %{state | next_query_set_id: id + 1}}
+  defp take_query_set_id(state, opts) do
+    case opts[:query_set_id] do
+      nil -> {state.next_query_set_id, %{state | next_query_set_id: state.next_query_set_id + 1}}
+      id -> {id, state}
+    end
   end
 
   defp track_request(state, request_id, info) do

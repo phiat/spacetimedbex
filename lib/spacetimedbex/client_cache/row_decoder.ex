@@ -8,6 +8,7 @@ defmodule Spacetimedbex.ClientCache.RowDecoder do
 
   alias Spacetimedbex.BSATN.Decoder
   alias Spacetimedbex.Schema
+  alias Spacetimedbex.Types
 
   @typedoc "Decoded row changes for one table within a transaction."
   @type table_changes :: %{
@@ -115,6 +116,20 @@ defmodule Spacetimedbex.ClientCache.RowDecoder do
   def decode_value(data, :string), do: Decoder.decode_string(data)
   def decode_value(data, :bytes), do: Decoder.decode_bytes(data)
 
+  def decode_value(data, :identity),
+    do: map_ok(Decoder.decode_u256(data), &Types.identity_from_int/1)
+
+  def decode_value(data, :connection_id),
+    do: map_ok(Decoder.decode_u128(data), &Types.connection_id_from_int/1)
+
+  def decode_value(data, :timestamp),
+    do: map_ok(Decoder.decode_i64(data), &Types.timestamp_from_micros/1)
+
+  def decode_value(data, :time_duration),
+    do: map_ok(Decoder.decode_i64(data), &Types.duration_from_micros/1)
+
+  def decode_value(data, :uuid), do: map_ok(Decoder.decode_u128(data), &Types.uuid_from_int/1)
+
   def decode_value(data, {:array, inner_type}) do
     Decoder.decode_array(data, &decode_value(&1, inner_type))
   end
@@ -156,6 +171,9 @@ defmodule Spacetimedbex.ClientCache.RowDecoder do
   end
 
   def decode_value(_data, {:unknown, _}), do: {:error, :unknown_type}
+
+  defp map_ok({:ok, value, rest}, fun), do: {:ok, fun.(value), rest}
+  defp map_ok(error, _fun), do: error
 
   defp decode_pair(data, key_type, value_type) do
     with {:ok, k, rest} <- decode_value(data, key_type),

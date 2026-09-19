@@ -1,6 +1,6 @@
 defmodule Spacetimedbex.Client do
   @moduledoc """
-  High-level SpacetimeDB client that ties Connection, ClientCache, and Schema together.
+  High-level SpacetimeDB client that ties Connection, the local row cache, and Schema together.
 
   ## Usage
 
@@ -16,7 +16,7 @@ defmodule Spacetimedbex.Client do
         end
 
         def on_connect(identity, _conn_id, token, state) do
-          IO.puts("Connected with identity: \#{inspect(identity)}")
+          IO.puts("Connected with identity: \#{identity}")
           {:ok, Map.put(state, :token, token)}
         end
 
@@ -29,25 +29,41 @@ defmodule Spacetimedbex.Client do
       # Start it
       {:ok, pid} = Spacetimedbex.Client.start_link(MyApp.SpaceClient, %{})
 
-      # Call a reducer
-      Spacetimedbex.Client.call_reducer(pid, "create_user", %{"name" => "Alice", "age" => 30})
+      # Call a reducer; the request id matches the later on_reducer_result
+      {:ok, request_id} =
+        Spacetimedbex.Client.call_reducer(pid, "create_user", %{"name" => "Alice", "age" => 30})
+
+      # Add and remove subscriptions at runtime
+      {:ok, query_set_id} = Spacetimedbex.Client.subscribe(pid, ["SELECT * FROM messages"])
+      :ok = Spacetimedbex.Client.unsubscribe(pid, query_set_id)
 
       # Query the cache
       Spacetimedbex.Client.get_all(pid, "users")
+
+  ## Subscriptions
+
+  The `:subscriptions` in `config/0` form the first query set. `subscribe/2`
+  adds more query sets. Every active query set is (re)sent whenever the
+  connection is established, so query set ids stay valid across automatic
+  reconnects. Rows matched by several queries are ref-counted in the cache,
+  and row callbacks fire only when a row actually enters or leaves it.
 
   ## Callbacks
 
   All callbacks are optional except `config/0`.
 
   - `config()` — returns connection configuration map
-  - `on_connect(identity, connection_id, token, state)` — called on initial connection
+  - `on_connect(identity, connection_id, token, state)` — called on each (re)connection;
+    `identity` and `connection_id` are hex strings (see `Spacetimedbex.Types`)
   - `on_subscribe_applied(table_name, rows, state)` — called per table when subscription data arrives
+  - `on_subscription_error(query_set_id, error, state)` — called when the server rejects or
+    drops a query set; it is no longer active
   - `on_insert(table_name, row, state)` — called per inserted row, and per event-table row
     (event rows are never stored in the cache)
   - `on_delete(table_name, row, state)` — called per deleted row
   - `on_update(table_name, old_row, new_row, state)` — called when a row with the same PK is deleted then inserted (row replacement). If not implemented, `on_delete` then `on_insert` fire instead
-  - `on_transaction(changes, state)` — called with full transaction; return `{:ok, state, :skip_row_callbacks}` to suppress per-row callbacks
-  - `on_reducer_result(request_id, result, state)` — called when a reducer completes
+  - `on_transaction(changes, state)` — called with the transaction's effective changes; return `{:ok, state, :skip_row_callbacks}` to suppress per-row callbacks
+  - `on_reducer_result(request_id, result, state)` — called when a reducer called by this client completes
   - `on_unsubscribe_applied(query_set_id, rows, state)` — called when an unsubscribe completes; `rows` is a list of `%{table_name: name, rows: [row]}` (empty unless `send_dropped_rows: true`)
   - `on_query_result(request_id, result, state)` — called with one-off query results
   - `on_procedure_result(request_id, status, state)` — called when a procedure completes;
@@ -58,42 +74,43 @@ defmodule Spacetimedbex.Client do
   """
 
   @type state :: term()
+  @type request_id :: pos_integer()
+  @type query_set_id :: pos_integer()
   @type changes :: [
           %{
             table_name: String.t(),
             inserts: [map()],
-            deletes: [map()]
+            deletes: [map()],
+            events: [map()]
           }
         ]
 
   @callback config() :: map()
 
   @callback on_connect(
-              identity :: binary(),
-              connection_id :: binary(),
+              identity :: String.t(),
+              connection_id :: String.t(),
               token :: String.t(),
               state
             ) :: {:ok, state}
 
   @callback on_subscribe_applied(table_name :: String.t(), rows :: [map()], state) :: {:ok, state}
+  @callback on_subscription_error(query_set_id(), error :: String.t(), state) :: {:ok, state}
   @callback on_insert(table_name :: String.t(), row :: map(), state) :: {:ok, state}
   @callback on_delete(table_name :: String.t(), row :: map(), state) :: {:ok, state}
   @callback on_update(table_name :: String.t(), old_row :: map(), new_row :: map(), state) ::
               {:ok, state}
   @callback on_transaction(changes, state) :: {:ok, state} | {:ok, state, :skip_row_callbacks}
-  @callback on_reducer_result(request_id :: non_neg_integer(), result :: term(), state) ::
-              {:ok, state}
-  @callback on_unsubscribe_applied(query_set_id :: non_neg_integer(), rows :: [map()], state) ::
-              {:ok, state}
-  @callback on_query_result(request_id :: non_neg_integer(), result :: term(), state) ::
-              {:ok, state}
-  @callback on_procedure_result(request_id :: non_neg_integer(), status :: term(), state) ::
-              {:ok, state}
+  @callback on_reducer_result(request_id(), result :: term(), state) :: {:ok, state}
+  @callback on_unsubscribe_applied(query_set_id(), rows :: [map()], state) :: {:ok, state}
+  @callback on_query_result(request_id(), result :: term(), state) :: {:ok, state}
+  @callback on_procedure_result(request_id(), status :: term(), state) :: {:ok, state}
   @callback on_disconnect(reason :: term(), state) :: {:ok, state}
 
   @optional_callbacks [
     on_connect: 4,
     on_subscribe_applied: 3,
+    on_subscription_error: 3,
     on_insert: 3,
     on_delete: 3,
     on_update: 4,
@@ -114,17 +131,24 @@ defmodule Spacetimedbex.Client do
   use GenServer
 
   alias Spacetimedbex.BSATN.ValueEncoder
-  alias Spacetimedbex.ClientCache
-  alias Spacetimedbex.ClientCache.RowDecoder
+  alias Spacetimedbex.ClientCache.{RowDecoder, Store}
   alias Spacetimedbex.Connection
+  alias Spacetimedbex.Schema
+
+  # Request and query set ids are u32 on the wire.
+  @max_id 0xFFFF_FFFF
 
   defstruct [
     :callback_module,
     :user_state,
-    :cache_pid,
+    :store,
     :conn_pid,
     :schema,
-    :config
+    :config,
+    subscriptions: %{},
+    connected: false,
+    next_request_id: 1,
+    next_query_set_id: 1
   ]
 
   # --- Public API ---
@@ -135,7 +159,7 @@ defmodule Spacetimedbex.Client do
   ## Parameters
   - `module` — callback module that `use Spacetimedbex.Client`
   - `init_state` — initial user state passed to callbacks
-  - `opts` — GenServer options (e.g. `:name`)
+  - `opts` — `:name` (defaults to `module`) and `:config` (overrides `module.config()`)
   """
   def start_link(module, init_state, opts \\ []) do
     name = Keyword.get(opts, :name, module)
@@ -143,19 +167,39 @@ defmodule Spacetimedbex.Client do
     GenServer.start_link(__MODULE__, {module, init_state, config_override}, name: name)
   end
 
-  @doc "Call a reducer with a map of arguments. Auto-encodes via schema."
+  @doc """
+  Call a reducer with a map of arguments, encoded via the schema.
+
+  Returns `{:ok, request_id}`; the outcome arrives in `on_reducer_result/3`
+  with the same request id.
+  """
+  @spec call_reducer(GenServer.server(), String.t(), map()) ::
+          {:ok, request_id()} | {:error, term()}
   def call_reducer(pid, reducer_name, args_map \\ %{}) do
     GenServer.call(pid, {:call_reducer, reducer_name, args_map})
   end
 
-  @doc "Call a reducer with pre-encoded BSATN binary arguments."
+  @doc "Call a reducer with pre-encoded BSATN binary arguments. Returns `{:ok, request_id}`."
+  @spec call_reducer_raw(GenServer.server(), String.t(), binary()) :: {:ok, request_id()}
   def call_reducer_raw(pid, reducer_name, bsatn_binary) do
     GenServer.call(pid, {:call_reducer_raw, reducer_name, bsatn_binary})
   end
 
-  @doc "Call a procedure with pre-encoded BSATN binary arguments."
+  @doc "Call a procedure with pre-encoded BSATN binary arguments. Returns `{:ok, request_id}`."
+  @spec call_procedure_raw(GenServer.server(), String.t(), binary()) :: {:ok, request_id()}
   def call_procedure_raw(pid, procedure_name, bsatn_binary \\ <<>>) do
     GenServer.call(pid, {:call_procedure_raw, procedure_name, bsatn_binary})
+  end
+
+  @doc """
+  Subscribe to one or more SQL queries as a new query set.
+
+  Returns `{:ok, query_set_id}` for use with `unsubscribe/3`. Rows arrive via
+  `on_subscribe_applied/3`; a rejected query fires `on_subscription_error/3`.
+  """
+  @spec subscribe(GenServer.server(), [String.t()]) :: {:ok, query_set_id()}
+  def subscribe(pid, query_strings) when is_list(query_strings) and query_strings != [] do
+    GenServer.call(pid, {:subscribe, query_strings})
   end
 
   @doc """
@@ -163,15 +207,28 @@ defmodule Spacetimedbex.Client do
 
   Options: `:send_dropped_rows` (default `true`) — ask the server for the rows
   leaving the subscription so they can be removed from the local cache.
+
+  Returns `{:error, :unknown_query_set}` if the query set is not active.
   """
+  @spec unsubscribe(GenServer.server(), query_set_id(), keyword()) ::
+          :ok | {:error, :unknown_query_set}
   def unsubscribe(pid, query_set_id, opts \\ []) do
     opts = Keyword.put_new(opts, :send_dropped_rows, true)
     GenServer.call(pid, {:unsubscribe, query_set_id, opts})
   end
 
-  @doc "Execute a one-off SQL query via WebSocket."
+  @doc """
+  Execute a one-off SQL query via WebSocket. Returns `{:ok, request_id}`; the
+  result arrives in `on_query_result/3`.
+  """
+  @spec query(GenServer.server(), String.t()) :: {:ok, request_id()}
   def query(pid, query_string) do
     GenServer.call(pid, {:one_off_query, query_string})
+  end
+
+  @doc "List active query sets as `%{query_set_id => query_strings}`."
+  def subscriptions(pid) do
+    GenServer.call(pid, :subscriptions)
   end
 
   @doc "Get all rows from a cached table."
@@ -179,7 +236,10 @@ defmodule Spacetimedbex.Client do
     GenServer.call(pid, {:get_all, table_name})
   end
 
-  @doc "Find a row by primary key."
+  @doc """
+  Find a row by primary key (a tuple for composite keys). Tables without a
+  primary key are keyed by the full row.
+  """
   def find(pid, table_name, pk_value) do
     GenServer.call(pid, {:find, table_name, pk_value})
   end
@@ -205,92 +265,110 @@ defmodule Spacetimedbex.Client do
     host = Map.fetch!(config, :host)
     database = Map.fetch!(config, :database)
 
-    # Start ClientCache (fetches schema)
-    cache_opts = [host: host, database: database, handler: self()]
+    with {:ok, schema} <- fetch_schema(host, database),
+         {:ok, conn_pid} <- start_connection(config, host, database) do
+      state = %__MODULE__{
+        callback_module: module,
+        user_state: init_state,
+        store: Store.new(schema),
+        conn_pid: conn_pid,
+        schema: schema,
+        config: config
+      }
 
-    case ClientCache.start_link(cache_opts) do
-      {:ok, cache_pid} ->
-        schema = ClientCache.schema(cache_pid)
-
-        # Start Connection with handler: self()
-        conn_opts = [
-          host: host,
-          database: database,
-          handler: self(),
-          token: Map.get(config, :token),
-          compression: Map.get(config, :compression, :none)
-        ]
-
-        case Connection.start_link(conn_opts) do
-          {:ok, conn_pid} ->
-            state = %__MODULE__{
-              callback_module: module,
-              user_state: init_state,
-              cache_pid: cache_pid,
-              conn_pid: conn_pid,
-              schema: schema,
-              config: config
-            }
-
-            {:ok, state}
-
-          {:error, reason} ->
-            {:stop, {:connection_failed, reason}}
+      state =
+        case Map.get(config, :subscriptions, []) do
+          [] -> state
+          queries -> state |> add_subscription(queries) |> elem(1)
         end
 
-      {:error, reason} ->
-        {:stop, {:cache_failed, reason}}
+      {:ok, state}
     end
   end
 
   @impl true
   def handle_call({:call_reducer, reducer_name, args_map}, _from, state) do
-    case Map.get(state.schema.reducers, reducer_name) do
-      nil ->
-        {:reply, {:error, {:unknown_reducer, reducer_name}}, state}
-
-      reducer_def ->
-        case ValueEncoder.encode_reducer_args(args_map, reducer_def.params) do
-          {:ok, bsatn} ->
-            Connection.call_reducer(state.conn_pid, reducer_name, bsatn)
-            {:reply, :ok, state}
-
-          {:error, _} = err ->
-            {:reply, err, state}
-        end
+    with {:ok, reducer_def} <- fetch_reducer(state.schema, reducer_name),
+         {:ok, bsatn} <- ValueEncoder.encode_reducer_args(args_map, reducer_def.params) do
+      {id, state} = next_request_id(state)
+      Connection.call_reducer(state.conn_pid, reducer_name, bsatn, request_id: id)
+      {:reply, {:ok, id}, state}
+    else
+      {:error, _} = err -> {:reply, err, state}
     end
   end
 
-  def handle_call({:unsubscribe, query_set_id, opts}, _from, state) do
-    Connection.unsubscribe(state.conn_pid, query_set_id, opts)
-    {:reply, :ok, state}
-  end
-
-  def handle_call({:one_off_query, query_string}, _from, state) do
-    Connection.one_off_query(state.conn_pid, query_string)
-    {:reply, :ok, state}
-  end
-
   def handle_call({:call_reducer_raw, reducer_name, bsatn_binary}, _from, state) do
-    Connection.call_reducer(state.conn_pid, reducer_name, bsatn_binary)
-    {:reply, :ok, state}
+    {id, state} = next_request_id(state)
+    Connection.call_reducer(state.conn_pid, reducer_name, bsatn_binary, request_id: id)
+    {:reply, {:ok, id}, state}
   end
 
   def handle_call({:call_procedure_raw, procedure_name, bsatn_binary}, _from, state) do
-    Connection.call_procedure(state.conn_pid, procedure_name, bsatn_binary)
-    {:reply, :ok, state}
+    {id, state} = next_request_id(state)
+    Connection.call_procedure(state.conn_pid, procedure_name, bsatn_binary, request_id: id)
+    {:reply, {:ok, id}, state}
+  end
+
+  def handle_call({:one_off_query, query_string}, _from, state) do
+    {id, state} = next_request_id(state)
+    Connection.one_off_query(state.conn_pid, query_string, request_id: id)
+    {:reply, {:ok, id}, state}
+  end
+
+  def handle_call({:subscribe, query_strings}, _from, state) do
+    {query_set_id, state} = add_subscription(state, query_strings)
+
+    state =
+      if state.connected,
+        do: send_subscribe(state, query_set_id, query_strings),
+        else: state
+
+    {:reply, {:ok, query_set_id}, state}
+  end
+
+  def handle_call({:unsubscribe, query_set_id, opts}, _from, state) do
+    case Map.pop(state.subscriptions, query_set_id) do
+      {nil, _} ->
+        {:reply, {:error, :unknown_query_set}, state}
+
+      {_queries, subscriptions} ->
+        state = %{state | subscriptions: subscriptions}
+
+        # While disconnected the server holds no subscriptions to remove.
+        state =
+          if state.connected do
+            {id, state} = next_request_id(state)
+
+            Connection.unsubscribe(
+              state.conn_pid,
+              query_set_id,
+              Keyword.put(opts, :request_id, id)
+            )
+
+            state
+          else
+            state
+          end
+
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call(:subscriptions, _from, state) do
+    {:reply, state.subscriptions, state}
   end
 
   def handle_call({:get_all, table_name}, _from, state) do
-    {:reply, ClientCache.get_all(state.cache_pid, table_name), state}
+    {:reply, Store.get_all(state.store, table_name), state}
   end
 
   def handle_call({:find, table_name, pk_value}, _from, state) do
-    {:reply, ClientCache.find(state.cache_pid, table_name, pk_value), state}
+    {:reply, Store.find(state.store, table_name, pk_value), state}
   end
 
   def handle_call({:count, table_name}, _from, state) do
-    {:reply, ClientCache.count(state.cache_pid, table_name), state}
+    {:reply, Store.count(state.store, table_name), state}
   end
 
   def handle_call(:schema, _from, state) do
@@ -303,11 +381,6 @@ defmodule Spacetimedbex.Client do
     {:noreply, state}
   end
 
-  def handle_info({:cache_event, _event}, state) do
-    # Ignore cache events — we handle everything from Connection messages directly
-    {:noreply, state}
-  end
-
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -315,29 +388,29 @@ defmodule Spacetimedbex.Client do
   # --- SpacetimeDB Message Handling ---
 
   defp handle_spacetimedb_message({:identity, identity, conn_id, token}, state) do
-    # Auto-subscribe if configured
-    subscriptions = Map.get(state.config, :subscriptions, [])
-
-    if subscriptions != [] do
-      Connection.subscribe(state.conn_pid, subscriptions)
-    end
+    # (Re)send every active query set, keeping their ids stable.
+    state =
+      state.subscriptions
+      |> Enum.sort()
+      |> Enum.reduce(%{state | connected: true}, fn {id, queries}, acc ->
+        send_subscribe(acc, id, queries)
+      end)
 
     invoke_callback(state, :on_connect, [identity, conn_id, token])
   end
 
   defp handle_spacetimedb_message({:subscribe_applied, _query_set_id, table_rows}, state) do
     decoded = RowDecoder.decode_table_rows(state.schema, table_rows)
-
-    ClientCache.apply_changes(
-      state.cache_pid,
-      Enum.map(decoded, fn {table_name, rows} ->
-        %{table_name: table_name, inserts: rows, deletes: []}
-      end)
-    )
+    Store.apply_changes(state.store, table_changes(decoded, :inserts))
 
     Enum.reduce(decoded, state, fn {table_name, rows}, acc ->
       invoke_callback(acc, :on_subscribe_applied, [table_name, rows])
     end)
+  end
+
+  defp handle_spacetimedb_message({:subscription_error, query_set_id, error}, state) do
+    state = %{state | subscriptions: Map.delete(state.subscriptions, query_set_id)}
+    invoke_callback(state, :on_subscription_error, [query_set_id, error])
   end
 
   defp handle_spacetimedb_message({:transaction_update, query_sets}, state) do
@@ -345,6 +418,7 @@ defmodule Spacetimedbex.Client do
   end
 
   defp handle_spacetimedb_message({:reducer_result, req_id, _timestamp, result}, state) do
+    # The caller's own transaction arrives only here, never as a TransactionUpdate.
     state =
       case result do
         {:ok, _ret, %{query_sets: query_sets}} -> apply_transaction(state, query_sets)
@@ -361,12 +435,7 @@ defmodule Spacetimedbex.Client do
         nil -> []
       end
 
-    ClientCache.apply_changes(
-      state.cache_pid,
-      Enum.map(decoded, fn {table_name, rows} ->
-        %{table_name: table_name, inserts: [], deletes: rows}
-      end)
-    )
+    Store.apply_changes(state.store, table_changes(decoded, :deletes))
 
     rows = Enum.map(decoded, fn {table_name, rows} -> %{table_name: table_name, rows: rows} end)
     invoke_callback(state, :on_unsubscribe_applied, [query_set_id, rows])
@@ -383,17 +452,77 @@ defmodule Spacetimedbex.Client do
   defp handle_spacetimedb_message({:disconnected, reason, _attempt}, state) do
     # Rows may change while we're offline; the resubscribe after reconnect
     # repopulates the cache from scratch.
-    ClientCache.clear(state.cache_pid)
-    invoke_callback(state, :on_disconnect, [reason])
+    Store.clear(state.store)
+    invoke_callback(%{state | connected: false}, :on_disconnect, [reason])
   end
 
   defp handle_spacetimedb_message(_msg, state), do: state
 
   # --- Helpers ---
 
+  defp fetch_schema(host, database) do
+    case Schema.fetch(host, database) do
+      {:ok, schema} -> {:ok, schema}
+      {:error, reason} -> {:stop, {:schema_fetch_failed, reason}}
+    end
+  end
+
+  defp start_connection(config, host, database) do
+    conn_opts = [
+      host: host,
+      database: database,
+      handler: self(),
+      token: Map.get(config, :token),
+      compression: Map.get(config, :compression, :none)
+    ]
+
+    case Connection.start_link(conn_opts) do
+      {:ok, conn_pid} -> {:ok, conn_pid}
+      {:error, reason} -> {:stop, {:connection_failed, reason}}
+    end
+  end
+
+  defp fetch_reducer(schema, reducer_name) do
+    case Map.fetch(schema.reducers, reducer_name) do
+      {:ok, reducer_def} -> {:ok, reducer_def}
+      :error -> {:error, {:unknown_reducer, reducer_name}}
+    end
+  end
+
+  defp add_subscription(state, query_strings) do
+    {id, state} = next_query_set_id(state)
+    {id, %{state | subscriptions: Map.put(state.subscriptions, id, query_strings)}}
+  end
+
+  defp send_subscribe(state, query_set_id, query_strings) do
+    {request_id, state} = next_request_id(state)
+
+    Connection.subscribe(state.conn_pid, query_strings,
+      query_set_id: query_set_id,
+      request_id: request_id
+    )
+
+    state
+  end
+
+  defp next_request_id(%{next_request_id: id} = state),
+    do: {id, %{state | next_request_id: next_id(id)}}
+
+  defp next_query_set_id(%{next_query_set_id: id} = state),
+    do: {id, %{state | next_query_set_id: next_id(id)}}
+
+  defp next_id(@max_id), do: 1
+  defp next_id(id), do: id + 1
+
+  defp table_changes(decoded, kind) do
+    Enum.map(decoded, fn {table_name, rows} ->
+      Map.put(%{table_name: table_name, inserts: [], deletes: []}, kind, rows)
+    end)
+  end
+
   defp apply_transaction(state, query_sets) do
-    changes = RowDecoder.decode_query_sets(state.schema, query_sets)
-    ClientCache.apply_changes(state.cache_pid, changes)
+    changes =
+      Store.apply_changes(state.store, RowDecoder.decode_query_sets(state.schema, query_sets))
 
     case invoke_callback_result(state, :on_transaction, [changes]) do
       {:ok, new_state, :skip_row_callbacks} -> new_state
@@ -404,8 +533,8 @@ defmodule Spacetimedbex.Client do
 
   defp fire_row_callbacks(state, changes) do
     Enum.reduce(changes, state, fn %{table_name: table_name} = change, acc ->
-      {updates, deletes, inserts} =
-        match_updates(change.deletes, change.inserts, pk_names_for(acc, table_name))
+      pk_names = Store.pk_names(acc.store, table_name)
+      {updates, deletes, inserts} = match_updates(change.deletes, change.inserts, pk_names)
 
       acc = Enum.reduce(deletes, acc, &invoke_callback(&2, :on_delete, [table_name, &1]))
 
@@ -443,27 +572,18 @@ defmodule Spacetimedbex.Client do
   defp match_updates(deletes, inserts, []), do: {[], deletes, inserts}
 
   defp match_updates(deletes, inserts, pk_names) do
-    deletes_by_pk = Map.new(deletes, &{ClientCache.row_key(&1, pk_names), &1})
+    deletes_by_pk = Map.new(deletes, &{Store.row_key(&1, pk_names), &1})
 
     {updates, pure_inserts, unmatched} =
       Enum.reduce(inserts, {[], [], deletes_by_pk}, fn row, {upd, ins, dels} ->
-        case Map.pop(dels, ClientCache.row_key(row, pk_names)) do
+        case Map.pop(dels, Store.row_key(row, pk_names)) do
           {nil, dels} -> {upd, [row | ins], dels}
           {old_row, dels} -> {[{old_row, row} | upd], ins, dels}
         end
       end)
 
-    pure_deletes =
-      Enum.filter(deletes, &Map.has_key?(unmatched, ClientCache.row_key(&1, pk_names)))
-
+    pure_deletes = Enum.filter(deletes, &Map.has_key?(unmatched, Store.row_key(&1, pk_names)))
     {Enum.reverse(updates), pure_deletes, Enum.reverse(pure_inserts)}
-  end
-
-  defp pk_names_for(state, table_name) do
-    case Spacetimedbex.Schema.primary_key_names(state.schema, table_name) do
-      {:ok, names} -> names
-      {:error, _} -> []
-    end
   end
 
   defp invoke_callback(state, callback_name, args) do

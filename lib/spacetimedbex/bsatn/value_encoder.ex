@@ -7,6 +7,7 @@ defmodule Spacetimedbex.BSATN.ValueEncoder do
   """
 
   alias Spacetimedbex.BSATN.Encoder
+  alias Spacetimedbex.Types
 
   @doc """
   Encode an Elixir value to BSATN binary given its algebraic type.
@@ -42,6 +43,25 @@ defmodule Spacetimedbex.BSATN.ValueEncoder do
         {:ok, apply(Encoder, unquote(:"encode_#{type}"), [val])}
       else
         {:error, {:out_of_range, unquote(type), val}}
+      end
+    end
+  end
+
+  # Special types (see Spacetimedbex.Types): friendly form, raw integer, or the
+  # legacy single-field map such as %{"__identity__" => int}.
+  @special_types [
+    identity: {:identity_to_int, :u256},
+    connection_id: {:connection_id_to_int, :u128},
+    timestamp: {:timestamp_to_micros, :i64},
+    time_duration: {:duration_to_micros, :i64},
+    uuid: {:uuid_to_int, :u128}
+  ]
+
+  for {type, {to_wire, wire_type}} <- @special_types do
+    def encode_value(val, unquote(type)) do
+      case apply(Types, unquote(to_wire), [unwrap_marker(val, unquote(type))]) do
+        {:ok, wire_val} -> encode_value(wire_val, unquote(wire_type))
+        :error -> {:error, {:type_mismatch, unquote(type), val}}
       end
     end
   end
@@ -121,6 +141,15 @@ defmodule Spacetimedbex.BSATN.ValueEncoder do
   end
 
   # --- Internal ---
+
+  defp unwrap_marker(val, type) when is_map(val) and not is_struct(val) do
+    case fetch_field(val, Types.marker(type)) do
+      {:ok, inner} -> inner
+      :error -> val
+    end
+  end
+
+  defp unwrap_marker(val, _type), do: val
 
   defp find_variant(variants, name) do
     case Enum.find_index(variants, &(&1.name == name)) do

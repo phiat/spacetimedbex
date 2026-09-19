@@ -30,16 +30,27 @@ defmodule Spacetimedbex.IntegrationTest do
 
     assert_receive {:spacetimedb, {:identity, identity, connection_id, token}}, 5_000
 
-    assert is_binary(identity)
-    assert byte_size(identity) == 32
-    assert is_binary(connection_id)
-    assert byte_size(connection_id) == 16
+    assert identity =~ ~r/^[0-9a-f]{64}$/
+    assert connection_id =~ ~r/^[0-9a-f]{32}$/
     assert is_binary(token)
     assert String.length(token) > 0
 
     state = Connection.get_state(conn)
     assert state.connected == true
     refute Map.has_key?(state, :token)
+
+    Process.exit(conn, :normal)
+  end
+
+  test "WebSocket identity matches the hex identity from the HTTP API" do
+    {:ok, %{"identity" => http_identity, "token" => token}} =
+      Spacetimedbex.Http.create_identity(@host)
+
+    {:ok, conn} =
+      Connection.start_link(host: @host, database: @database, handler: self(), token: token)
+
+    assert_receive {:spacetimedb, {:identity, ws_identity, _, _}}, 5_000
+    assert ws_identity == http_identity
 
     Process.exit(conn, :normal)
   end
@@ -113,6 +124,11 @@ defmodule Spacetimedbex.IntegrationTest do
 
     assert has_reducer_result or has_tx_update,
            "Expected reducer_result or transaction_update, got: #{inspect(all_messages)}"
+
+    # Reducer timestamps decode to a DateTime close to now
+    timestamps = for {:reducer_result, _, ts, _} <- all_messages, do: ts
+    assert [%DateTime{} = ts | _] = timestamps
+    assert abs(DateTime.diff(ts, DateTime.utc_now())) < 60
 
     Process.exit(conn, :normal)
   end
