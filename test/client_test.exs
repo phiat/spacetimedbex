@@ -1,8 +1,10 @@
 defmodule Spacetimedbex.ClientTest do
   use ExUnit.Case, async: false
 
+  alias Spacetimedbex.BSATN.Encoder
   alias Spacetimedbex.Client
   alias Spacetimedbex.ClientCache
+  alias Spacetimedbex.Schema
   alias Spacetimedbex.TestSchema
 
   # --- Test callback module that records calls ---
@@ -70,6 +72,24 @@ defmodule Spacetimedbex.ClientTest do
 
     def on_disconnect(reason, state) do
       send(state.test_pid, {:callback, :on_disconnect, reason})
+      {:ok, state}
+    end
+  end
+
+  # --- Callback module without on_update ---
+
+  defmodule InsertDeleteOnlyClient do
+    use Spacetimedbex.Client
+
+    def config, do: %{host: "localhost:3000", database: "testmodule"}
+
+    def on_insert(table, row, state) do
+      send(state.test_pid, {:callback, :on_insert, table, row})
+      {:ok, state}
+    end
+
+    def on_delete(table, row, state) do
+      send(state.test_pid, {:callback, :on_delete, table, row})
       {:ok, state}
     end
   end
@@ -180,7 +200,10 @@ defmodule Spacetimedbex.ClientTest do
           tables: [
             %{
               table_name: "person",
-              rows: [{:persistent, %{inserts: row_list, deletes: %{size_hint: {:fixed_size, 0}, rows_data: <<>>}}}]
+              rows: [
+                {:persistent,
+                 %{inserts: row_list, deletes: %{size_hint: {:fixed_size, 0}, rows_data: <<>>}}}
+              ]
             }
           ]
         }
@@ -190,7 +213,9 @@ defmodule Spacetimedbex.ClientTest do
         Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
 
       assert_receive {:callback, :on_transaction, changes}
-      assert [%{table_name: "person", inserts: [%{"id" => 2, "name" => "Bob"}], deletes: []}] = changes
+
+      assert [%{table_name: "person", inserts: [%{"id" => 2, "name" => "Bob"}], deletes: []}] =
+               changes
 
       assert_receive {:callback, :on_insert, "person", %{"id" => 2, "name" => "Bob", "age" => 25}}
     end
@@ -204,7 +229,10 @@ defmodule Spacetimedbex.ClientTest do
           tables: [
             %{
               table_name: "person",
-              rows: [{:persistent, %{inserts: %{size_hint: {:fixed_size, 0}, rows_data: <<>>}, deletes: row_list}}]
+              rows: [
+                {:persistent,
+                 %{inserts: %{size_hint: {:fixed_size, 0}, rows_data: <<>>}, deletes: row_list}}
+              ]
             }
           ]
         }
@@ -214,7 +242,9 @@ defmodule Spacetimedbex.ClientTest do
         Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
 
       assert_receive {:callback, :on_transaction, _changes}
-      assert_receive {:callback, :on_delete, "person", %{"id" => 3, "name" => "Carol", "age" => 40}}
+
+      assert_receive {:callback, :on_delete, "person",
+                      %{"id" => 3, "name" => "Carol", "age" => 40}}
     end
 
     test "on_transaction with skip_row_callbacks suppresses per-row callbacks" do
@@ -226,7 +256,10 @@ defmodule Spacetimedbex.ClientTest do
           tables: [
             %{
               table_name: "person",
-              rows: [{:persistent, %{inserts: row_list, deletes: %{size_hint: {:fixed_size, 0}, rows_data: <<>>}}}]
+              rows: [
+                {:persistent,
+                 %{inserts: row_list, deletes: %{size_hint: {:fixed_size, 0}, rows_data: <<>>}}}
+              ]
             }
           ]
         }
@@ -261,9 +294,88 @@ defmodule Spacetimedbex.ClientTest do
       state = build_client_state()
 
       {:noreply, _new_state} =
-        Client.handle_info({:spacetimedb, {:unsubscribe_applied, 42, []}}, state)
+        Client.handle_info({:spacetimedb, {:unsubscribe_applied, 42, nil}}, state)
 
       assert_receive {:callback, :on_unsubscribe_applied, 42, []}
+    end
+
+    test "unsubscribe_applied with dropped rows removes them from the cache" do
+      state = build_client_state()
+      row_list = TestSchema.person_row_list(1, "Alice", 30)
+      table_rows = [%{table_name: "person", rows: row_list}]
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:subscribe_applied, 1, table_rows}}, state)
+
+      assert ClientCache.count(state.cache_pid, "person") == 1
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:unsubscribe_applied, 1, {:some, table_rows}}}, state)
+
+      assert_receive {:callback, :on_unsubscribe_applied, 1,
+                      [%{table_name: "person", rows: [%{"id" => 1}]}]}
+
+      assert ClientCache.count(state.cache_pid, "person") == 0
+    end
+
+    test "event-table rows fire on_insert and are not cached" do
+      state = build_client_state()
+
+      query_sets = [
+        %{
+          tables: [
+            %{table_name: "person", rows: [{:event, TestSchema.person_row_list(9, "Evt", 1)}]}
+          ]
+        }
+      ]
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+
+      assert_receive {:callback, :on_insert, "person", %{"id" => 9}}
+      assert ClientCache.count(state.cache_pid, "person") == 0
+    end
+
+    test "PK update falls back to on_delete + on_insert when on_update is not implemented" do
+      state = build_client_state(callback_module: InsertDeleteOnlyClient)
+
+      query_sets = [
+        %{
+          tables: [
+            %{
+              table_name: "person",
+              rows: [
+                {:persistent,
+                 %{
+                   inserts: TestSchema.person_row_list(1, "Alice", 31),
+                   deletes: TestSchema.person_row_list(1, "Alice", 30)
+                 }}
+              ]
+            }
+          ]
+        }
+      ]
+
+      {:noreply, _state} =
+        Client.handle_info({:spacetimedb, {:transaction_update, query_sets}}, state)
+
+      assert_receive {:callback, :on_delete, "person", %{"age" => 30}}
+      assert_receive {:callback, :on_insert, "person", %{"age" => 31}}
+    end
+
+    test "disconnect clears the cache" do
+      state = build_client_state()
+      table_rows = [%{table_name: "person", rows: TestSchema.person_row_list(1, "Alice", 30)}]
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:subscribe_applied, 1, table_rows}}, state)
+
+      assert ClientCache.count(state.cache_pid, "person") == 1
+
+      {:noreply, state} =
+        Client.handle_info({:spacetimedb, {:disconnected, :remote, 1}}, state)
+
+      assert ClientCache.count(state.cache_pid, "person") == 0
     end
 
     test "one_off_query_result fires callback" do
@@ -412,6 +524,34 @@ defmodule Spacetimedbex.ClientTest do
   end
 
   describe "ClientCache with injected schema" do
+    test "tables without a primary key keep every distinct row" do
+      schema = %Schema{
+        tables: %{
+          "log" => %{name: "log", columns: [%{name: "msg", type: :string}], primary_key: []}
+        },
+        reducers: %{},
+        typespace: []
+      }
+
+      {:ok, cache} = ClientCache.start_link(schema: schema)
+      enc = &Encoder.encode_string/1
+      rows_data = enc.("a") <> enc.("b") <> enc.("c")
+      row_list = %{size_hint: {:row_offsets, [0, 5, 10]}, rows_data: rows_data}
+
+      ClientCache.handle_event(
+        cache,
+        {:subscribe_applied, 1, [%{table_name: "log", rows: row_list}]}
+      )
+
+      assert ClientCache.count(cache, "log") == 3
+
+      ClientCache.apply_changes(cache, [
+        %{table_name: "log", inserts: [], deletes: [%{"msg" => "b"}]}
+      ])
+
+      assert Enum.sort(ClientCache.get_all(cache, "log")) == [%{"msg" => "a"}, %{"msg" => "c"}]
+    end
+
     test "starts without HTTP fetch" do
       schema = TestSchema.person_schema()
       {:ok, cache} = ClientCache.start_link(schema: schema)
@@ -439,7 +579,12 @@ defmodule Spacetimedbex.ClientTest do
       {:ok, cache} = ClientCache.start_link(schema: schema)
 
       row_list = TestSchema.person_row_list(42, "Bob", 25)
-      ClientCache.handle_event(cache, {:subscribe_applied, 0, [%{table_name: "person", rows: row_list}]})
+
+      ClientCache.handle_event(
+        cache,
+        {:subscribe_applied, 0, [%{table_name: "person", rows: row_list}]}
+      )
+
       Process.sleep(20)
 
       assert %{"id" => 42, "name" => "Bob"} = ClientCache.find(cache, "person", 42)
@@ -452,7 +597,12 @@ defmodule Spacetimedbex.ClientTest do
       assert ClientCache.count(cache, "person") == 0
 
       row_list = TestSchema.person_row_list(1, "Alice", 30)
-      ClientCache.handle_event(cache, {:subscribe_applied, 0, [%{table_name: "person", rows: row_list}]})
+
+      ClientCache.handle_event(
+        cache,
+        {:subscribe_applied, 0, [%{table_name: "person", rows: row_list}]}
+      )
+
       Process.sleep(20)
 
       assert ClientCache.count(cache, "person") == 1

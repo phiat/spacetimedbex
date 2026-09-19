@@ -165,7 +165,9 @@ defmodule Spacetimedbex.BSATN.ValueEncoderTest do
 
     test "missing product field" do
       columns = [%{name: "x", type: :u32}, %{name: "y", type: :u32}]
-      assert {:error, {:missing_field, "y"}} = ValueEncoder.encode_value(%{"x" => 1}, {:product, columns})
+
+      assert {:error, {:missing_field, "y"}} =
+               ValueEncoder.encode_value(%{"x" => 1}, {:product, columns})
     end
   end
 
@@ -192,7 +194,9 @@ defmodule Spacetimedbex.BSATN.ValueEncoderTest do
 
     test "returns error for missing param" do
       params = [%{name: "x", type: :u32}, %{name: "y", type: :u32}]
-      assert {:error, {:missing_field, "y"}} = ValueEncoder.encode_reducer_args(%{"x" => 1}, params)
+
+      assert {:error, {:missing_field, "y"}} =
+               ValueEncoder.encode_reducer_args(%{"x" => 1}, params)
     end
   end
 
@@ -200,5 +204,65 @@ defmodule Spacetimedbex.BSATN.ValueEncoderTest do
     {:ok, encoded} = ValueEncoder.encode_value(value, type)
     {:ok, decoded, <<>>} = RowDecoder.decode_value(encoded, type)
     assert decoded == value
+  end
+
+  describe "integer range validation" do
+    test "rejects out-of-range values instead of raising or wrapping" do
+      assert {:error, {:out_of_range, :u8, 256}} = ValueEncoder.encode_value(256, :u8)
+      assert {:error, {:out_of_range, :u32, -1}} = ValueEncoder.encode_value(-1, :u32)
+      assert {:error, {:out_of_range, :i8, -129}} = ValueEncoder.encode_value(-129, :i8)
+
+      assert {:error, {:out_of_range, :u64, _}} =
+               ValueEncoder.encode_value(0x1_0000_0000_0000_0000, :u64)
+    end
+
+    test "accepts boundary values" do
+      assert_roundtrip(0xFF, :u8)
+      assert_roundtrip(-128, :i8)
+      assert_roundtrip(Bitwise.bsl(1, 256) - 1, :u256)
+      assert_roundtrip(-Bitwise.bsl(1, 255), :i256)
+    end
+
+    test "out-of-range reducer arg returns an error" do
+      params = [%{name: "age", type: :u8}]
+
+      assert {:error, {:out_of_range, :u8, 300}} =
+               ValueEncoder.encode_reducer_args(%{age: 300}, params)
+    end
+  end
+
+  describe "sum and map encoding" do
+    @shape {:sum,
+            [
+              %{name: "Circle", type: {:product, [%{name: "r", type: :u32}]}},
+              %{name: "Empty", type: {:product, []}}
+            ]}
+
+    test "variant with payload roundtrips" do
+      assert_roundtrip({"Circle", %{"r" => 3}}, @shape)
+    end
+
+    test "unit variant accepts a bare name or atom" do
+      assert {:ok, <<1>>} = ValueEncoder.encode_value("Empty", @shape)
+      assert {:ok, <<1>>} = ValueEncoder.encode_value(:Empty, @shape)
+      assert {:ok, <<0, 3::little-32>>} = ValueEncoder.encode_value({:Circle, %{r: 3}}, @shape)
+    end
+
+    test "bare name for a variant with payload is a type mismatch" do
+      assert {:error, {:type_mismatch, _, "Circle"}} = ValueEncoder.encode_value("Circle", @shape)
+    end
+
+    test "unknown variant" do
+      assert {:error, {:unknown_variant, "Square"}} = ValueEncoder.encode_value("Square", @shape)
+    end
+
+    test "map roundtrips" do
+      assert_roundtrip(%{1 => 10, 2 => 20}, {:map, :u8, :u32})
+    end
+
+    test "nested products accept atom keys" do
+      type = {:product, [%{name: "pos", type: {:product, [%{name: "x", type: :i32}]}}]}
+      assert {:ok, <<5::little-32>>} = ValueEncoder.encode_value(%{pos: %{x: 5}}, type)
+    end
   end
 end

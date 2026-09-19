@@ -6,7 +6,7 @@ defmodule Spacetimedbex.BSATN do
   the `Encodable` protocol for custom types.
   """
 
-  alias Spacetimedbex.BSATN.{Encoder, Decoder}
+  alias Spacetimedbex.BSATN.{Decoder, Encoder}
 
   defdelegate encode_bool(val), to: Encoder
   defdelegate encode_u8(val), to: Encoder

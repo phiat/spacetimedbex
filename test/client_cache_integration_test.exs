@@ -7,10 +7,10 @@ defmodule Spacetimedbex.ClientCacheIntegrationTest do
 
   @moduletag :integration
 
-  alias Spacetimedbex.{Connection, ClientCache, Schema}
   alias Spacetimedbex.BSATN.Encoder
+  alias Spacetimedbex.{ClientCache, Connection, Schema}
 
-  @host "localhost:3000"
+  @host System.get_env("SPACETIMEDB_HOST", "localhost:3000")
   @database "testmodule"
 
   test "fetch schema from live server" do

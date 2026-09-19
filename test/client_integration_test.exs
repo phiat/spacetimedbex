@@ -14,7 +14,7 @@ defmodule Spacetimedbex.ClientIntegrationTest do
 
     def config do
       %{
-        host: "localhost:3000",
+        host: System.get_env("SPACETIMEDB_HOST", "localhost:3000"),
         database: "testmodule",
         subscriptions: ["SELECT * FROM person"]
       }
@@ -65,7 +65,11 @@ defmodule Spacetimedbex.ClientIntegrationTest do
     assert is_list(rows)
 
     # Call add_person reducer
-    :ok = Spacetimedbex.Client.call_reducer(pid, "add_person", %{"name" => "IntegTestUser", "age" => 99})
+    :ok =
+      Spacetimedbex.Client.call_reducer(pid, "add_person", %{
+        "name" => "IntegTestUser",
+        "age" => 99
+      })
 
     # Should receive reducer result
     assert_receive {:reducer_result, _req_id, _result}, 10_000

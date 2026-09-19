@@ -4,7 +4,7 @@ defmodule Spacetimedbex.BSATNTest do
   import Bitwise
 
   alias Spacetimedbex.BSATN
-  alias Spacetimedbex.BSATN.{Encoder, Decoder}
+  alias Spacetimedbex.BSATN.{Decoder, Encoder}
 
   describe "bool" do
     test "roundtrip true" do

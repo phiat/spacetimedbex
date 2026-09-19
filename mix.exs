@@ -29,11 +29,10 @@ defmodule Spacetimedbex.MixProject do
   defp deps do
     [
       {:websockex, "~> 0.4"},
-      {:jason, "~> 1.4"},
-      {:req, "~> 0.5"},
+      {:req, "~> 0.5 or ~> 0.6 or ~> 0.7"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
   end
 

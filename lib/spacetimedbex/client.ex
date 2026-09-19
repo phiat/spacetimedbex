@@ -42,14 +42,19 @@ defmodule Spacetimedbex.Client do
   - `config()` — returns connection configuration map
   - `on_connect(identity, connection_id, token, state)` — called on initial connection
   - `on_subscribe_applied(table_name, rows, state)` — called per table when subscription data arrives
-  - `on_insert(table_name, row, state)` — called per inserted row
+  - `on_insert(table_name, row, state)` — called per inserted row, and per event-table row
+    (event rows are never stored in the cache)
   - `on_delete(table_name, row, state)` — called per deleted row
-  - `on_update(table_name, old_row, new_row, state)` — called when a row with the same PK is deleted then inserted (row replacement)
+  - `on_update(table_name, old_row, new_row, state)` — called when a row with the same PK is deleted then inserted (row replacement). If not implemented, `on_delete` then `on_insert` fire instead
   - `on_transaction(changes, state)` — called with full transaction; return `{:ok, state, :skip_row_callbacks}` to suppress per-row callbacks
   - `on_reducer_result(request_id, result, state)` — called when a reducer completes
-  - `on_unsubscribe_applied(query_set_id, rows, state)` — called when an unsubscribe completes
+  - `on_unsubscribe_applied(query_set_id, rows, state)` — called when an unsubscribe completes; `rows` is a list of `%{table_name: name, rows: [row]}` (empty unless `send_dropped_rows: true`)
   - `on_query_result(request_id, result, state)` — called with one-off query results
-  - `on_disconnect(reason, state)` — called on disconnection
+  - `on_procedure_result(request_id, status, state)` — called when a procedure completes;
+    status is `{:returned, bsatn_binary}` or `{:internal_error, message}`
+  - `on_disconnect(reason, state)` — called on disconnection. The local cache is cleared;
+    after an automatic reconnect the subscriptions are re-applied and
+    `on_subscribe_applied` fires again with fresh rows.
   """
 
   @type state :: term()
@@ -82,6 +87,8 @@ defmodule Spacetimedbex.Client do
               {:ok, state}
   @callback on_query_result(request_id :: non_neg_integer(), result :: term(), state) ::
               {:ok, state}
+  @callback on_procedure_result(request_id :: non_neg_integer(), status :: term(), state) ::
+              {:ok, state}
   @callback on_disconnect(reason :: term(), state) :: {:ok, state}
 
   @optional_callbacks [
@@ -94,6 +101,7 @@ defmodule Spacetimedbex.Client do
     on_reducer_result: 3,
     on_unsubscribe_applied: 3,
     on_query_result: 3,
+    on_procedure_result: 3,
     on_disconnect: 2
   ]
 
@@ -104,8 +112,6 @@ defmodule Spacetimedbex.Client do
   end
 
   use GenServer
-
-  require Logger
 
   alias Spacetimedbex.BSATN.ValueEncoder
   alias Spacetimedbex.ClientCache
@@ -147,8 +153,19 @@ defmodule Spacetimedbex.Client do
     GenServer.call(pid, {:call_reducer_raw, reducer_name, bsatn_binary})
   end
 
-  @doc "Unsubscribe from a query set by ID. Options: `:send_dropped_rows`."
+  @doc "Call a procedure with pre-encoded BSATN binary arguments."
+  def call_procedure_raw(pid, procedure_name, bsatn_binary \\ <<>>) do
+    GenServer.call(pid, {:call_procedure_raw, procedure_name, bsatn_binary})
+  end
+
+  @doc """
+  Unsubscribe from a query set by ID.
+
+  Options: `:send_dropped_rows` (default `true`) — ask the server for the rows
+  leaving the subscription so they can be removed from the local cache.
+  """
   def unsubscribe(pid, query_set_id, opts \\ []) do
+    opts = Keyword.put_new(opts, :send_dropped_rows, true)
     GenServer.call(pid, {:unsubscribe, query_set_id, opts})
   end
 
@@ -181,6 +198,9 @@ defmodule Spacetimedbex.Client do
 
   @impl true
   def init({module, init_state, config_override}) do
+    # Callbacks are detected with function_exported?/3, which requires the
+    # module to be loaded (it may not be when a :config override is given).
+    Code.ensure_loaded!(module)
     config = config_override || module.config()
     host = Map.fetch!(config, :host)
     database = Map.fetch!(config, :database)
@@ -256,6 +276,11 @@ defmodule Spacetimedbex.Client do
     {:reply, :ok, state}
   end
 
+  def handle_call({:call_procedure_raw, procedure_name, bsatn_binary}, _from, state) do
+    Connection.call_procedure(state.conn_pid, procedure_name, bsatn_binary)
+    {:reply, :ok, state}
+  end
+
   def handle_call({:get_all, table_name}, _from, state) do
     {:reply, ClientCache.get_all(state.cache_pid, table_name), state}
   end
@@ -300,48 +325,50 @@ defmodule Spacetimedbex.Client do
     invoke_callback(state, :on_connect, [identity, conn_id, token])
   end
 
-  defp handle_spacetimedb_message({:subscribe_applied, query_set_id, table_rows}, state) do
-    # Feed to cache
-    ClientCache.handle_event(state.cache_pid, {:subscribe_applied, query_set_id, table_rows})
+  defp handle_spacetimedb_message({:subscribe_applied, _query_set_id, table_rows}, state) do
+    decoded = RowDecoder.decode_table_rows(state.schema, table_rows)
 
-    # Decode and fire callbacks per table
-    Enum.reduce(table_rows, state, fn %{table_name: table_name, rows: row_list}, acc ->
-      rows = decode_rows(acc, table_name, row_list)
+    ClientCache.apply_changes(
+      state.cache_pid,
+      Enum.map(decoded, fn {table_name, rows} ->
+        %{table_name: table_name, inserts: rows, deletes: []}
+      end)
+    )
+
+    Enum.reduce(decoded, state, fn {table_name, rows}, acc ->
       invoke_callback(acc, :on_subscribe_applied, [table_name, rows])
     end)
   end
 
   defp handle_spacetimedb_message({:transaction_update, query_sets}, state) do
-    # Feed to cache
-    ClientCache.handle_event(state.cache_pid, {:transaction_update, query_sets})
-
-    # Build decoded changes
-    changes = decode_transaction_changes(state, query_sets)
-
-    # Fire on_transaction, check if we should skip row callbacks
-    case invoke_callback_result(state, :on_transaction, [changes]) do
-      {:ok, new_state, :skip_row_callbacks} ->
-        new_state
-
-      {:ok, new_state} ->
-        fire_row_callbacks(new_state, changes)
-
-      :not_implemented ->
-        fire_row_callbacks(state, changes)
-    end
+    apply_transaction(state, query_sets)
   end
 
-  defp handle_spacetimedb_message({:reducer_result, req_id, timestamp, result}, state) do
-    # Feed to cache (handles embedded transaction)
-    ClientCache.handle_event(state.cache_pid, {:reducer_result, req_id, timestamp, result})
-
-    # If result contains a transaction, decode and fire row callbacks
-    state = handle_reducer_transaction(state, result)
+  defp handle_spacetimedb_message({:reducer_result, req_id, _timestamp, result}, state) do
+    state =
+      case result do
+        {:ok, _ret, %{query_sets: query_sets}} -> apply_transaction(state, query_sets)
+        _ -> state
+      end
 
     invoke_callback(state, :on_reducer_result, [req_id, result])
   end
 
-  defp handle_spacetimedb_message({:unsubscribe_applied, query_set_id, rows}, state) do
+  defp handle_spacetimedb_message({:unsubscribe_applied, query_set_id, table_rows}, state) do
+    decoded =
+      case table_rows do
+        {:some, rows} -> RowDecoder.decode_table_rows(state.schema, rows)
+        nil -> []
+      end
+
+    ClientCache.apply_changes(
+      state.cache_pid,
+      Enum.map(decoded, fn {table_name, rows} ->
+        %{table_name: table_name, inserts: [], deletes: rows}
+      end)
+    )
+
+    rows = Enum.map(decoded, fn {table_name, rows} -> %{table_name: table_name, rows: rows} end)
     invoke_callback(state, :on_unsubscribe_applied, [query_set_id, rows])
   end
 
@@ -349,7 +376,14 @@ defmodule Spacetimedbex.Client do
     invoke_callback(state, :on_query_result, [request_id, result])
   end
 
+  defp handle_spacetimedb_message({:procedure_result, request_id, status}, state) do
+    invoke_callback(state, :on_procedure_result, [request_id, status])
+  end
+
   defp handle_spacetimedb_message({:disconnected, reason, _attempt}, state) do
+    # Rows may change while we're offline; the resubscribe after reconnect
+    # repopulates the cache from scratch.
+    ClientCache.clear(state.cache_pid)
     invoke_callback(state, :on_disconnect, [reason])
   end
 
@@ -357,104 +391,79 @@ defmodule Spacetimedbex.Client do
 
   # --- Helpers ---
 
-  defp decode_rows(state, table_name, row_list) do
-    case Spacetimedbex.Schema.columns_for(state.schema, table_name) do
-      {:ok, columns} -> RowDecoder.decode_row_list(row_list, columns)
-      {:error, _} -> []
+  defp apply_transaction(state, query_sets) do
+    changes = RowDecoder.decode_query_sets(state.schema, query_sets)
+    ClientCache.apply_changes(state.cache_pid, changes)
+
+    case invoke_callback_result(state, :on_transaction, [changes]) do
+      {:ok, new_state, :skip_row_callbacks} -> new_state
+      {:ok, new_state} -> fire_row_callbacks(new_state, changes)
+      :not_implemented -> fire_row_callbacks(state, changes)
     end
   end
 
-  defp decode_transaction_changes(state, query_sets) do
-    Enum.flat_map(query_sets, fn %{tables: tables} ->
-      Enum.flat_map(tables, &decode_table_changes(state, &1))
-    end)
-  end
-
-  defp decode_table_changes(state, %{table_name: table_name, rows: update_rows}) do
-    Enum.flat_map(update_rows, fn
-      {:persistent, %{inserts: inserts, deletes: deletes}} ->
-        [
-          %{
-            table_name: table_name,
-            inserts: decode_rows(state, table_name, inserts),
-            deletes: decode_rows(state, table_name, deletes)
-          }
-        ]
-
-      {:event, _} ->
-        []
-    end)
-  end
-
-  defp handle_reducer_transaction(state, {:ok, _ret, %{query_sets: query_sets}}) do
-    changes = decode_transaction_changes(state, query_sets)
-    fire_row_callbacks(state, changes)
-  end
-
-  defp handle_reducer_transaction(state, _), do: state
-
   defp fire_row_callbacks(state, changes) do
-    Enum.reduce(changes, state, fn %{table_name: table_name, inserts: inserts, deletes: deletes},
-                                   acc ->
-      pk_names = pk_names_for(acc, table_name)
-      {updates, pure_deletes, pure_inserts} = match_updates(deletes, inserts, pk_names)
+    Enum.reduce(changes, state, fn %{table_name: table_name} = change, acc ->
+      {updates, deletes, inserts} =
+        match_updates(change.deletes, change.inserts, pk_names_for(acc, table_name))
+
+      acc = Enum.reduce(deletes, acc, &invoke_callback(&2, :on_delete, [table_name, &1]))
 
       acc =
-        Enum.reduce(pure_deletes, acc, fn row, inner_acc ->
-          invoke_callback(inner_acc, :on_delete, [table_name, row])
+        Enum.reduce(updates, acc, fn {old_row, new_row}, inner ->
+          fire_update(inner, table_name, old_row, new_row)
         end)
 
-      acc =
-        Enum.reduce(updates, acc, fn {old_row, new_row}, inner_acc ->
-          invoke_callback(inner_acc, :on_update, [table_name, old_row, new_row])
-        end)
-
-      Enum.reduce(pure_inserts, acc, fn row, inner_acc ->
-        invoke_callback(inner_acc, :on_insert, [table_name, row])
-      end)
+      # Event-table rows are transient: surfaced via on_insert, never cached.
+      Enum.reduce(
+        inserts ++ change.events,
+        acc,
+        &invoke_callback(&2, :on_insert, [table_name, &1])
+      )
     end)
   end
+
+  defp fire_update(state, table_name, old_row, new_row) do
+    case invoke_callback_result(state, :on_update, [table_name, old_row, new_row]) do
+      :not_implemented ->
+        state
+        |> invoke_callback(:on_delete, [table_name, old_row])
+        |> invoke_callback(:on_insert, [table_name, new_row])
+
+      {:ok, new_state} ->
+        new_state
+
+      {:ok, new_state, _} ->
+        new_state
+    end
+  end
+
+  # Pairs deletes and inserts sharing a primary key into updates.
+  # Returns {updates, pure_deletes, pure_inserts}; tables without a PK have no updates.
+  defp match_updates(deletes, inserts, []), do: {[], deletes, inserts}
 
   defp match_updates(deletes, inserts, pk_names) do
-    delete_by_pk =
-      Map.new(deletes, fn row -> {extract_pk_value(row, pk_names), row} end)
+    deletes_by_pk = Map.new(deletes, &{ClientCache.row_key(&1, pk_names), &1})
 
-    {updates, pure_inserts} =
-      Enum.reduce(inserts, {[], []}, fn row, {upd, ins} ->
-        pk = extract_pk_value(row, pk_names)
-
-        case Map.get(delete_by_pk, pk) do
-          nil -> {upd, [row | ins]}
-          old_row -> {[{old_row, row} | upd], ins}
+    {updates, pure_inserts, unmatched} =
+      Enum.reduce(inserts, {[], [], deletes_by_pk}, fn row, {upd, ins, dels} ->
+        case Map.pop(dels, ClientCache.row_key(row, pk_names)) do
+          {nil, dels} -> {upd, [row | ins], dels}
+          {old_row, dels} -> {[{old_row, row} | upd], ins, dels}
         end
       end)
 
-    matched_pks = MapSet.new(updates, fn {old, _new} -> extract_pk_value(old, pk_names) end)
-
     pure_deletes =
-      Enum.reject(deletes, fn row ->
-        MapSet.member?(matched_pks, extract_pk_value(row, pk_names))
-      end)
+      Enum.filter(deletes, &Map.has_key?(unmatched, ClientCache.row_key(&1, pk_names)))
 
     {Enum.reverse(updates), pure_deletes, Enum.reverse(pure_inserts)}
   end
 
   defp pk_names_for(state, table_name) do
-    case Map.get(state.schema.tables, table_name) do
-      nil ->
-        []
-
-      table_def ->
-        Enum.map(table_def.primary_key, fn i ->
-          Enum.at(table_def.columns, i).name
-        end)
+    case Spacetimedbex.Schema.primary_key_names(state.schema, table_name) do
+      {:ok, names} -> names
+      {:error, _} -> []
     end
-  end
-
-  defp extract_pk_value(row, [single_pk]), do: Map.get(row, single_pk)
-
-  defp extract_pk_value(row, pk_names) do
-    List.to_tuple(Enum.map(pk_names, &Map.get(row, &1)))
   end
 
   defp invoke_callback(state, callback_name, args) do

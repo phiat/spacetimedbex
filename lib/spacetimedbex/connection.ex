@@ -32,8 +32,17 @@ defmodule Spacetimedbex.Connection do
   require Logger
 
   alias Spacetimedbex.Protocol.ClientMessage
-  alias Spacetimedbex.Protocol.ClientMessage.{Subscribe, Unsubscribe, OneOffQuery, CallReducer}
+
+  alias Spacetimedbex.Protocol.ClientMessage.{
+    CallProcedure,
+    CallReducer,
+    OneOffQuery,
+    Subscribe,
+    Unsubscribe
+  }
+
   alias Spacetimedbex.Protocol.ServerMessage
+  alias Spacetimedbex.Url
 
   defstruct [
     :host,
@@ -62,17 +71,27 @@ defmodule Spacetimedbex.Connection do
   Start a WebSocket connection to SpacetimeDB.
 
   ## Options
-  - `:host` - Host and port (e.g., "localhost:3000"). Required.
+  - `:host` - Host and port (e.g., "localhost:3000"). Prefix with `https://` to connect
+    over TLS (`wss://`), e.g. `"https://maincloud.spacetimedb.com"`. Required.
   - `:database` - Database name or identity. Required.
-  - `:token` - JWT auth token. Optional (server will mint one if omitted).
-  - `:handler` - PID to receive `{:spacetimedb, msg}` messages. Required.
-  - `:compression` - Compression preference: `:none`, `:gzip`, `:brotli`. Default `:none`.
+  - `:token` - JWT auth token. Optional (server will mint one if omitted). Reconnects
+    reuse the token issued by the server, so the identity survives a reconnect.
+  - `:handler` - PID or registered name to receive `{:spacetimedb, msg}` messages. Required.
+  - `:compression` - Compression preference: `:none` or `:gzip`. Default `:none`.
+    (Brotli is not supported.)
   - `:max_reconnect_attempts` - Max reconnection attempts before giving up. Default 5.
   - `:base_backoff_ms` - Base backoff time in ms (multiplied by attempt). Default 1000.
   - `:max_backoff_ms` - Maximum backoff time in ms. Default 10000.
   - `:name` - Optional process name registration.
   """
   def start_link(opts) do
+    case Keyword.get(opts, :compression, :none) do
+      c when c in [:none, :gzip] -> do_start_link(opts)
+      other -> {:error, {:unsupported_compression, other}}
+    end
+  end
+
+  defp do_start_link(opts) do
     host = Keyword.fetch!(opts, :host)
     database = Keyword.fetch!(opts, :database)
     handler = Keyword.fetch!(opts, :handler)
@@ -113,7 +132,9 @@ defmodule Spacetimedbex.Connection do
 
   @doc "Unsubscribe from a query set."
   def unsubscribe(conn, query_set_id, opts \\ []) do
-    flags = if Keyword.get(opts, :send_dropped_rows, false), do: :send_dropped_rows, else: :default
+    flags =
+      if Keyword.get(opts, :send_dropped_rows, false), do: :send_dropped_rows, else: :default
+
     WebSockex.cast(conn, {:unsubscribe, query_set_id, flags})
   end
 
@@ -127,16 +148,20 @@ defmodule Spacetimedbex.Connection do
     WebSockex.cast(conn, {:call_reducer, reducer_name, args_bsatn})
   end
 
+  @doc """
+  Call a procedure with BSATN-encoded arguments. The result arrives as
+  `{:spacetimedb, {:procedure_result, request_id, status}}` where status is
+  `{:returned, bsatn_binary}` or `{:internal_error, message}`.
+  """
+  def call_procedure(conn, procedure_name, args_bsatn \\ <<>>) do
+    WebSockex.cast(conn, {:call_procedure, procedure_name, args_bsatn})
+  end
+
   @doc "Get the current connection state."
   def get_state(conn) do
-    ref = make_ref()
-    WebSockex.cast(conn, {:get_state, self(), ref})
-
-    receive do
-      {:spacetimedb_state, ^ref, state} -> state
-    after
-      5_000 -> {:error, :timeout}
-    end
+    conn |> :sys.get_state(5_000) |> sanitize_state()
+  catch
+    :exit, {:timeout, _} -> {:error, :timeout}
   end
 
   # --- WebSockex Callbacks ---
@@ -226,16 +251,16 @@ defmodule Spacetimedbex.Connection do
     {:reply, {:binary, ClientMessage.encode(msg)}, state}
   end
 
-  def handle_cast({:get_state, caller, ref}, state) do
-    send(caller, {:spacetimedb_state, ref, sanitize_state(state)})
-    {:ok, state}
+  def handle_cast({:call_procedure, procedure_name, args_bsatn}, state) do
+    {request_id, state} = next_request_id(state)
+    msg = %CallProcedure{request_id: request_id, procedure: procedure_name, args: args_bsatn}
+    state = track_request(state, request_id, {:call_procedure, procedure_name})
+    {:reply, {:binary, ClientMessage.encode(msg)}, state}
   end
 
   @impl true
-  def handle_disconnect(%{reason: reason, attempt_number: attempt}, state) do
-    Logger.warning(
-      "SpacetimeDB: Disconnected (attempt #{attempt}): #{inspect(reason)}"
-    )
+  def handle_disconnect(%{reason: reason, attempt_number: attempt, conn: conn}, state) do
+    Logger.warning("SpacetimeDB: Disconnected (attempt #{attempt}): #{inspect(reason)}")
 
     state = %{state | connected: false, pending_requests: %{}}
     notify(state, {:disconnected, reason, attempt})
@@ -243,7 +268,8 @@ defmodule Spacetimedbex.Connection do
     if attempt < state.max_reconnect_attempts do
       backoff = min(state.base_backoff_ms * attempt, state.max_backoff_ms)
       Process.sleep(backoff)
-      {:reconnect, state}
+      # Rebuild headers so the reconnect presents the latest server-issued token.
+      {:reconnect, %{conn | extra_headers: build_headers(state.token)}, state}
     else
       Logger.error("SpacetimeDB: Max reconnection attempts reached, giving up")
       notify(state, :connection_failed)
@@ -265,10 +291,9 @@ defmodule Spacetimedbex.Connection do
       case compression do
         :none -> "None"
         :gzip -> "Gzip"
-        :brotli -> "Brotli"
       end
 
-    "ws://#{host}/v1/database/#{database}/subscribe?compression=#{compression_param}"
+    "#{Url.ws_base(host)}/database/#{Url.segment(database)}/subscribe?compression=#{compression_param}"
   end
 
   defp build_headers(nil) do
@@ -347,11 +372,12 @@ defmodule Spacetimedbex.Connection do
     %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
   end
 
-  defp notify(%{handler: handler}, message) when is_pid(handler) do
+  defp notify(%{handler: handler}, message) do
     send(handler, {:spacetimedb, message})
   end
 
-  defp sanitize_state(state) do
+  @doc false
+  def sanitize_state(state) do
     %{
       host: state.host,
       database: state.database,

@@ -22,14 +22,17 @@ defmodule Spacetimedbex.ClientCache do
 
   require Logger
 
-  alias Spacetimedbex.Schema
   alias Spacetimedbex.ClientCache.RowDecoder
+  alias Spacetimedbex.Protocol.ServerMessage.TransactionUpdate
+  alias Spacetimedbex.Schema
 
-  defstruct [:schema, :ets_tables, :handler]
+  defstruct [:schema, :tables, :handler]
+
+  @type table_meta :: %{tid: :ets.table(), pk_names: [String.t()]}
 
   @type t :: %__MODULE__{
           schema: Schema.t() | nil,
-          ets_tables: %{String.t() => :ets.table()},
+          tables: %{String.t() => table_meta()},
           handler: pid() | nil
         }
 
@@ -55,7 +58,11 @@ defmodule Spacetimedbex.ClientCache do
     GenServer.call(cache, {:get_all, table_name})
   end
 
-  @doc "Find a row by primary key value."
+  @doc """
+  Find a row by primary key value (a tuple for composite keys).
+
+  Tables without a primary key are keyed by the full row map.
+  """
   def find(cache, table_name, pk_value) do
     GenServer.call(cache, {:find, table_name, pk_value})
   end
@@ -71,12 +78,33 @@ defmodule Spacetimedbex.ClientCache do
   end
 
   @doc """
-  Process a SpacetimeDB event. Called by the connection handler to feed
-  events into the cache.
+  Process a raw SpacetimeDB event (as delivered by `Spacetimedbex.Connection`),
+  decoding rows with the cache's schema.
   """
   def handle_event(cache, event) do
     GenServer.cast(cache, {:event, event})
   end
+
+  @doc """
+  Apply already-decoded changes, as produced by
+  `Spacetimedbex.ClientCache.RowDecoder.decode_query_sets/2`. Deletes are
+  applied before inserts so primary-key updates land correctly.
+  """
+  def apply_changes(cache, changes) when is_list(changes) do
+    GenServer.cast(cache, {:apply, changes})
+  end
+
+  @doc "Remove all cached rows (e.g. after a disconnect)."
+  def clear(cache) do
+    GenServer.cast(cache, :clear)
+  end
+
+  @doc false
+  # Cache key for a row: the primary key value, a tuple for composite keys,
+  # or the whole row when the table has no primary key.
+  def row_key(row, []), do: row
+  def row_key(row, [single_pk]), do: Map.get(row, single_pk)
+  def row_key(row, pk_names), do: List.to_tuple(Enum.map(pk_names, &Map.get(row, &1)))
 
   # --- GenServer callbacks ---
 
@@ -92,13 +120,13 @@ defmodule Spacetimedbex.ClientCache do
 
     case schema_result do
       {:ok, schema} ->
-        ets_tables = create_ets_tables(schema)
+        tables = create_tables(schema)
 
         Logger.info(
           "ClientCache: initialized with #{map_size(schema.tables)} table(s): #{Enum.join(Map.keys(schema.tables), ", ")}"
         )
 
-        {:ok, %__MODULE__{schema: schema, ets_tables: ets_tables, handler: handler}}
+        {:ok, %__MODULE__{schema: schema, tables: tables, handler: handler}}
 
       {:error, reason} ->
         Logger.error("ClientCache: failed to fetch schema: #{inspect(reason)}")
@@ -109,9 +137,9 @@ defmodule Spacetimedbex.ClientCache do
   @impl true
   def handle_call({:get_all, table_name}, _from, state) do
     result =
-      case Map.get(state.ets_tables, table_name) do
+      case Map.get(state.tables, table_name) do
         nil -> []
-        tid -> :ets.tab2list(tid) |> Enum.map(fn {_key, row} -> row end)
+        %{tid: tid} -> :ets.select(tid, [{{:_, :"$1"}, [], [:"$1"]}])
       end
 
     {:reply, result, state}
@@ -119,15 +147,11 @@ defmodule Spacetimedbex.ClientCache do
 
   def handle_call({:find, table_name, pk_value}, _from, state) do
     result =
-      case Map.get(state.ets_tables, table_name) do
-        nil ->
-          nil
-
-        tid ->
-          case :ets.lookup(tid, pk_value) do
-            [{_key, row}] -> row
-            [] -> nil
-          end
+      with %{tid: tid} <- Map.get(state.tables, table_name),
+           [{_key, row}] <- :ets.lookup(tid, pk_value) do
+        row
+      else
+        _ -> nil
       end
 
     {:reply, result, state}
@@ -135,9 +159,9 @@ defmodule Spacetimedbex.ClientCache do
 
   def handle_call({:count, table_name}, _from, state) do
     result =
-      case Map.get(state.ets_tables, table_name) do
+      case Map.get(state.tables, table_name) do
         nil -> 0
-        tid -> :ets.info(tid, :size)
+        %{tid: tid} -> :ets.info(tid, :size)
       end
 
     {:reply, result, state}
@@ -149,131 +173,86 @@ defmodule Spacetimedbex.ClientCache do
 
   @impl true
   def handle_cast({:event, event}, state) do
-    state = process_event(event, state)
+    process_event(event, state)
+    {:noreply, state}
+  end
+
+  def handle_cast({:apply, changes}, state) do
+    apply_decoded(changes, state)
+    {:noreply, state}
+  end
+
+  def handle_cast(:clear, state) do
+    Enum.each(state.tables, fn {_name, %{tid: tid}} -> :ets.delete_all_objects(tid) end)
     {:noreply, state}
   end
 
   # --- Event processing ---
 
-  defp process_event({:subscribe_applied, _query_set_id, rows}, state) do
-    Enum.each(rows, fn %{table_name: table_name, rows: row_list} ->
-      apply_inserts(state, table_name, row_list)
+  defp process_event({:subscribe_applied, _query_set_id, table_rows}, state) do
+    state.schema
+    |> RowDecoder.decode_table_rows(table_rows)
+    |> Enum.map(fn {table_name, rows} ->
+      %{table_name: table_name, inserts: rows, deletes: []}
     end)
+    |> apply_decoded(state)
 
     notify(state, :subscribe_applied)
-    state
+  end
+
+  defp process_event({:unsubscribe_applied, _query_set_id, {:some, table_rows}}, state) do
+    state.schema
+    |> RowDecoder.decode_table_rows(table_rows)
+    |> Enum.map(fn {table_name, rows} ->
+      %{table_name: table_name, inserts: [], deletes: rows}
+    end)
+    |> apply_decoded(state)
+
+    notify(state, :unsubscribe_applied)
   end
 
   defp process_event({:transaction_update, query_sets}, state) do
-    Enum.each(query_sets, fn %{tables: tables} ->
-      Enum.each(tables, &apply_table_update(state, &1))
-    end)
+    state.schema
+    |> RowDecoder.decode_query_sets(query_sets)
+    |> apply_decoded(state)
 
     notify(state, :transaction_update)
-    state
   end
 
   defp process_event(
-         {:reducer_result, _req_id, _timestamp,
-          {:ok, _ret, %Spacetimedbex.Protocol.ServerMessage.TransactionUpdate{query_sets: qs}}},
+         {:reducer_result, _req_id, _timestamp, {:ok, _ret, %TransactionUpdate{query_sets: qs}}},
          state
        ) do
     process_event({:transaction_update, qs}, state)
   end
 
-  defp process_event({:reducer_result, _req_id, _timestamp, :ok_empty}, state) do
-    notify(state, :reducer_result)
-    state
-  end
-
   defp process_event({:reducer_result, _req_id, _timestamp, _other}, state) do
     notify(state, :reducer_result)
-    state
   end
 
-  defp process_event(_event, state), do: state
+  defp process_event(_event, _state), do: :ok
 
-  defp apply_table_update(state, %{table_name: table_name, rows: update_rows}) do
-    Enum.each(update_rows, fn
-      {:persistent, %{inserts: inserts, deletes: deletes}} ->
-        apply_deletes(state, table_name, deletes)
-        apply_inserts(state, table_name, inserts)
+  defp apply_decoded(changes, state) do
+    Enum.each(changes, fn %{table_name: table_name} = change ->
+      case Map.get(state.tables, table_name) do
+        nil ->
+          Logger.warning("ClientCache: no table #{table_name} in schema")
 
-      {:event, _events} ->
-        :ok
+        %{tid: tid, pk_names: pk_names} ->
+          Enum.each(change.deletes, &:ets.delete(tid, row_key(&1, pk_names)))
+          :ets.insert(tid, Enum.map(change.inserts, &{row_key(&1, pk_names), &1}))
+      end
     end)
   end
 
   # --- ETS operations ---
 
-  defp create_ets_tables(schema) do
+  defp create_tables(schema) do
     Map.new(schema.tables, fn {table_name, _table_def} ->
+      {:ok, pk_names} = Schema.primary_key_names(schema, table_name)
       tid = :ets.new(:spacetimedbex_table, [:set, :protected])
-      {table_name, tid}
+      {table_name, %{tid: tid, pk_names: pk_names}}
     end)
-  end
-
-  defp apply_inserts(state, table_name, row_list) do
-    case {Map.get(state.ets_tables, table_name), Schema.columns_for(state.schema, table_name)} do
-      {nil, _} ->
-        Logger.warning("ClientCache: no ETS table for #{table_name}")
-
-      {_, {:error, _}} ->
-        Logger.warning("ClientCache: no schema for #{table_name}")
-
-      {tid, {:ok, columns}} ->
-        rows = RowDecoder.decode_row_list(row_list, columns)
-        pk_indices = pk_indices_for(state.schema, table_name)
-        pk_names = Enum.map(pk_indices, fn i -> Enum.at(columns, i) end) |> Enum.map(& &1.name)
-
-        Enum.each(rows, fn row ->
-          pk_value = extract_pk(row, pk_names)
-          :ets.insert(tid, {pk_value, row})
-        end)
-
-        if rows != [] do
-          Logger.debug("ClientCache: inserted #{length(rows)} row(s) into #{table_name}")
-        end
-    end
-  end
-
-  defp apply_deletes(state, table_name, row_list) do
-    case {Map.get(state.ets_tables, table_name), Schema.columns_for(state.schema, table_name)} do
-      {nil, _} ->
-        :ok
-
-      {_, {:error, _}} ->
-        :ok
-
-      {tid, {:ok, columns}} ->
-        rows = RowDecoder.decode_row_list(row_list, columns)
-        pk_indices = pk_indices_for(state.schema, table_name)
-        pk_names = Enum.map(pk_indices, fn i -> Enum.at(columns, i) end) |> Enum.map(& &1.name)
-
-        Enum.each(rows, fn row ->
-          pk_value = extract_pk(row, pk_names)
-          :ets.delete(tid, pk_value)
-        end)
-
-        if rows != [] do
-          Logger.debug("ClientCache: deleted #{length(rows)} row(s) from #{table_name}")
-        end
-    end
-  end
-
-  defp pk_indices_for(schema, table_name) do
-    case Schema.primary_key_for(schema, table_name) do
-      {:ok, indices} -> indices
-      {:error, _} -> [0]
-    end
-  end
-
-  defp extract_pk(row, [single_pk]) do
-    Map.get(row, single_pk)
-  end
-
-  defp extract_pk(row, pk_names) do
-    List.to_tuple(Enum.map(pk_names, &Map.get(row, &1)))
   end
 
   defp notify(%{handler: nil}, _event), do: :ok

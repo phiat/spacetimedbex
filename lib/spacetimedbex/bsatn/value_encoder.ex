@@ -19,19 +19,33 @@ defmodule Spacetimedbex.BSATN.ValueEncoder do
       iex> encode_value("hello", :string)
       {:ok, <<5, 0, 0, 0, "hello">>}
   """
+  @int_ranges %{
+    u8: {0, 0xFF},
+    i8: {-0x80, 0x7F},
+    u16: {0, 0xFFFF},
+    i16: {-0x8000, 0x7FFF},
+    u32: {0, 0xFFFF_FFFF},
+    i32: {-0x8000_0000, 0x7FFF_FFFF},
+    u64: {0, 0xFFFF_FFFF_FFFF_FFFF},
+    i64: {-0x8000_0000_0000_0000, 0x7FFF_FFFF_FFFF_FFFF},
+    u128: {0, Bitwise.bsl(1, 128) - 1},
+    i128: {-Bitwise.bsl(1, 127), Bitwise.bsl(1, 127) - 1},
+    u256: {0, Bitwise.bsl(1, 256) - 1},
+    i256: {-Bitwise.bsl(1, 255), Bitwise.bsl(1, 255) - 1}
+  }
+
   def encode_value(val, :bool) when is_boolean(val), do: {:ok, Encoder.encode_bool(val)}
-  def encode_value(val, :u8) when is_integer(val), do: {:ok, Encoder.encode_u8(val)}
-  def encode_value(val, :i8) when is_integer(val), do: {:ok, Encoder.encode_i8(val)}
-  def encode_value(val, :u16) when is_integer(val), do: {:ok, Encoder.encode_u16(val)}
-  def encode_value(val, :i16) when is_integer(val), do: {:ok, Encoder.encode_i16(val)}
-  def encode_value(val, :u32) when is_integer(val), do: {:ok, Encoder.encode_u32(val)}
-  def encode_value(val, :i32) when is_integer(val), do: {:ok, Encoder.encode_i32(val)}
-  def encode_value(val, :u64) when is_integer(val), do: {:ok, Encoder.encode_u64(val)}
-  def encode_value(val, :i64) when is_integer(val), do: {:ok, Encoder.encode_i64(val)}
-  def encode_value(val, :u128) when is_integer(val), do: {:ok, Encoder.encode_u128(val)}
-  def encode_value(val, :i128) when is_integer(val), do: {:ok, Encoder.encode_i128(val)}
-  def encode_value(val, :u256) when is_integer(val), do: {:ok, Encoder.encode_u256(val)}
-  def encode_value(val, :i256) when is_integer(val), do: {:ok, Encoder.encode_i256(val)}
+
+  for {type, {min, max}} <- @int_ranges do
+    def encode_value(val, unquote(type)) when is_integer(val) do
+      if val >= unquote(min) and val <= unquote(max) do
+        {:ok, apply(Encoder, unquote(:"encode_#{type}"), [val])}
+      else
+        {:error, {:out_of_range, unquote(type), val}}
+      end
+    end
+  end
+
   def encode_value(val, :f32) when is_float(val), do: {:ok, Encoder.encode_f32(val)}
   def encode_value(val, :f64) when is_float(val), do: {:ok, Encoder.encode_f64(val)}
   # Allow integers for float types (auto-convert)
@@ -64,6 +78,30 @@ defmodule Spacetimedbex.BSATN.ValueEncoder do
     encode_product(val, columns)
   end
 
+  # Sum: `{variant_name, payload}` (name as string or atom). Unit variants may
+  # also be given as a bare name, e.g. `"Active"` or `:Active`.
+  def encode_value({name, payload}, {:sum, variants}) when is_binary(name) or is_atom(name) do
+    with {:ok, tag, type} <- find_variant(variants, to_string(name)),
+         {:ok, encoded} <- encode_value(payload, type) do
+      {:ok, Encoder.encode_sum(tag, encoded)}
+    end
+  end
+
+  def encode_value(name, {:sum, variants} = type)
+      when is_binary(name) or (is_atom(name) and not is_nil(name) and not is_boolean(name)) do
+    case find_variant(variants, to_string(name)) do
+      {:ok, tag, {:product, []}} -> {:ok, Encoder.encode_sum(tag, <<>>)}
+      {:ok, _tag, _type} -> {:error, {:type_mismatch, type, name}}
+      error -> error
+    end
+  end
+
+  def encode_value(val, {:map, key_type, value_type}) when is_map(val) do
+    with {:ok, body} <- encode_all(val, &encode_pair(&1, key_type, value_type)) do
+      {:ok, <<map_size(val)::little-unsigned-32, body::binary>>}
+    end
+  end
+
   def encode_value(val, type) do
     {:error, {:type_mismatch, type, val}}
   end
@@ -79,49 +117,66 @@ defmodule Spacetimedbex.BSATN.ValueEncoder do
   - `params` - List of `%{name: String.t(), type: algebraic_type()}` from schema
   """
   def encode_reducer_args(args_map, params) when is_map(args_map) and is_list(params) do
-    # Normalize keys to strings
-    normalized =
-      Map.new(args_map, fn
-        {k, v} when is_atom(k) -> {Atom.to_string(k), v}
-        {k, v} when is_binary(k) -> {k, v}
-      end)
-
-    encode_product(normalized, params)
+    encode_product(args_map, params)
   end
 
   # --- Internal ---
 
-  defp encode_array(elements, inner_type) do
-    results = Enum.map(elements, &encode_value(&1, inner_type))
-
-    case Enum.find(results, &match?({:error, _}, &1)) do
-      nil ->
-        encoded_elements = Enum.map(results, fn {:ok, bin} -> bin end)
-        count = length(encoded_elements)
-        body = IO.iodata_to_binary(encoded_elements)
-        {:ok, <<count::little-unsigned-32, body::binary>>}
-
-      error ->
-        error
+  defp find_variant(variants, name) do
+    case Enum.find_index(variants, &(&1.name == name)) do
+      nil -> {:error, {:unknown_variant, name}}
+      tag -> {:ok, tag, Enum.at(variants, tag).type}
     end
   end
 
+  defp encode_array(elements, inner_type) do
+    with {:ok, body} <- encode_all(elements, &encode_value(&1, inner_type)) do
+      {:ok, <<length(elements)::little-unsigned-32, body::binary>>}
+    end
+  end
+
+  # Fields may be keyed by string or atom at any nesting level.
   defp encode_product(val_map, columns) do
-    results =
-      Enum.map(columns, fn %{name: name, type: type} ->
-        case Map.fetch(val_map, name) do
-          {:ok, val} -> encode_value(val, type)
-          :error -> {:error, {:missing_field, name}}
-        end
-      end)
+    encode_all(columns, fn %{name: name, type: type} ->
+      case fetch_field(val_map, name) do
+        {:ok, val} -> encode_value(val, type)
+        :error -> {:error, {:missing_field, name}}
+      end
+    end)
+  end
 
-    case Enum.find(results, &match?({:error, _}, &1)) do
-      nil ->
-        binaries = Enum.map(results, fn {:ok, bin} -> bin end)
-        {:ok, IO.iodata_to_binary(binaries)}
+  defp fetch_field(map, name) do
+    case Map.fetch(map, name) do
+      {:ok, _} = found -> found
+      :error -> Enum.find_value(map, :error, &atom_key_match(&1, name))
+    end
+  end
 
-      error ->
-        error
+  defp atom_key_match({k, v}, name) when is_atom(k) do
+    if Atom.to_string(k) == name, do: {:ok, v}
+  end
+
+  defp atom_key_match(_, _name), do: nil
+
+  defp encode_pair({k, v}, key_type, value_type) do
+    with {:ok, ek} <- encode_value(k, key_type),
+         {:ok, ev} <- encode_value(v, value_type) do
+      {:ok, [ek, ev]}
+    end
+  end
+
+  # Encodes each element with `fun`, stopping at the first error.
+  defp encode_all(enumerable, fun) do
+    enumerable
+    |> Enum.reduce_while([], fn el, acc ->
+      case fun.(el) do
+        {:ok, bin} -> {:cont, [acc | bin]}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:error, _} = err -> err
+      iodata -> {:ok, IO.iodata_to_binary(iodata)}
     end
   end
 end

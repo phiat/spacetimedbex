@@ -13,10 +13,10 @@ defmodule Spacetimedbex.IntegrationTest do
 
   @moduletag :integration
 
-  alias Spacetimedbex.Connection
   alias Spacetimedbex.BSATN.Encoder
+  alias Spacetimedbex.Connection
 
-  @host "localhost:3000"
+  @host System.get_env("SPACETIMEDB_HOST", "localhost:3000")
   @database "testmodule"
 
   test "connect and receive identity" do
@@ -37,10 +37,9 @@ defmodule Spacetimedbex.IntegrationTest do
     assert is_binary(token)
     assert String.length(token) > 0
 
-    ref = make_ref()
-    WebSockex.cast(conn, {:get_state, self(), ref})
-    assert_receive {:spacetimedb_state, ^ref, state}, 1_000
+    state = Connection.get_state(conn)
     assert state.connected == true
+    refute Map.has_key?(state, :token)
 
     Process.exit(conn, :normal)
   end

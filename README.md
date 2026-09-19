@@ -76,6 +76,9 @@ defmodule MyApp.SpaceClient do
 end
 ```
 
+For TLS (e.g. Maincloud), prefix the host with a scheme: `host: "https://maincloud.spacetimedb.com"`
+uses `https://` for HTTP and `wss://` for the WebSocket. A bare `host:port` uses plain HTTP/WS.
+
 Start it and interact:
 
 ```elixir
@@ -103,14 +106,22 @@ All callbacks are optional except `config/0`:
 |----------|---------------|
 | `on_connect(identity, conn_id, token, state)` | Initial connection established |
 | `on_subscribe_applied(table, rows, state)` | Subscription data arrives |
-| `on_insert(table, row, state)` | Row inserted |
+| `on_insert(table, row, state)` | Row inserted (also fires for event-table rows, which are never cached) |
 | `on_delete(table, row, state)` | Row deleted |
-| `on_update(table, old_row, new_row, state)` | Row replaced (same PK deleted + inserted) |
+| `on_update(table, old_row, new_row, state)` | Row replaced (same PK deleted + inserted). If not implemented, `on_delete` + `on_insert` fire instead |
 | `on_transaction(changes, state)` | Full transaction — return `{:ok, state, :skip_row_callbacks}` to suppress per-row callbacks |
 | `on_reducer_result(request_id, result, state)` | Reducer completes |
 | `on_unsubscribe_applied(query_set_id, rows, state)` | Unsubscribe completes |
 | `on_query_result(request_id, result, state)` | One-off query result arrives |
-| `on_disconnect(reason, state)` | Disconnected |
+| `on_procedure_result(request_id, status, state)` | Procedure completes (`call_procedure_raw/3`) |
+| `on_disconnect(reason, state)` | Disconnected — the cache is cleared and repopulated when the auto-reconnect resubscribes |
+
+### Decoded values
+
+Rows are maps with string keys. Options decode to `{:some, value}` or `nil`; sums (enums)
+decode to `{"Variant", payload}` (unit variants have payload `%{}`). When encoding reducer
+arguments, sums also accept `{:Variant, payload}` or a bare `"Variant"`/`:Variant` for unit
+variants; integers are range-checked against their column type.
 
 ### Code Generation
 
@@ -185,6 +196,8 @@ Binary SpacetimeDB Algebraic Type Notation — a compact little-endian binary fo
 
 ### Protocol (v2)
 
+Tested against SpacetimeDB 2.10.1. The v2 wire format is unchanged since 2.0.
+
 Client sends: `Subscribe`, `Unsubscribe`, `OneOffQuery`, `CallReducer`, `CallProcedure`.
 
 Server sends (with 1-byte compression envelope): `InitialConnection`, `SubscribeApplied`, `UnsubscribeApplied`, `SubscriptionError`, `TransactionUpdate`, `OneOffQueryResult`, `ReducerResult`, `ProcedureResult`.
@@ -204,7 +217,8 @@ Application
 ```bash
 mix deps.get          # Install dependencies
 just test             # Unit tests (no server needed)
-just test-all         # All tests (requires SpacetimeDB on :3000)
+just test-all         # All tests (requires SpacetimeDB with the test_module published;
+                      # set SPACETIMEDB_HOST to override localhost:3000)
 just check            # Compile (strict) + test + credo
 just shell            # iex -S mix
 ```

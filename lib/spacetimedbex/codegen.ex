@@ -125,7 +125,7 @@ defmodule Spacetimedbex.Codegen do
       """
     else
       param_names = Enum.map(reducer_def.params, & &1.name)
-      param_list = Enum.join(param_names, ", ")
+      param_list = Enum.map_join(param_names, ", ", &to_snake_case/1)
 
       args_map =
         Enum.map_join(param_names, ", ", fn name ->
@@ -191,6 +191,10 @@ defmodule Spacetimedbex.Codegen do
       #   {:ok, state}
       # end
 
+      # def on_update(table_name, old_row, new_row, state) do
+      #   {:ok, state}
+      # end
+
       # def on_transaction(changes, state) do
       #   {:ok, state}
       # end
@@ -232,8 +236,10 @@ defmodule Spacetimedbex.Codegen do
   def type_to_typespec({:option, inner}), do: "#{type_to_typespec(inner)} | nil"
   def type_to_typespec({:product, [%{name: "__identity__", type: :u256}]}), do: "integer()"
 
-  def type_to_typespec({:product, [%{name: "__timestamp_micros_since_unix_epoch__", type: :i64}]}),
-    do: "integer()"
+  def type_to_typespec(
+        {:product, [%{name: "__timestamp_micros_since_unix_epoch__", type: :i64}]}
+      ),
+      do: "integer()"
 
   def type_to_typespec({:product, _}), do: "map()"
   def type_to_typespec({:sum, _}), do: "term()"

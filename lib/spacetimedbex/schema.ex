@@ -55,7 +55,8 @@ defmodule Spacetimedbex.Schema do
 
   @doc "Fetch and parse schema from a SpacetimeDB instance."
   def fetch(host, database) do
-    url = "http://#{host}/v1/database/#{database}/schema?version=#{@schema_version}"
+    url =
+      "#{Spacetimedbex.Url.http_base(host)}/database/#{Spacetimedbex.Url.segment(database)}/schema?version=#{@schema_version}"
 
     case Req.get(url) do
       {:ok, %{status: 200, body: body}} when is_map(body) ->
@@ -73,7 +74,7 @@ defmodule Spacetimedbex.Schema do
   def parse(raw) when is_map(raw) do
     typespace = parse_typespace(raw["typespace"])
     tables = parse_tables(raw["tables"], typespace)
-    reducers = parse_reducers(raw["reducers"])
+    reducers = parse_reducers(raw["reducers"], typespace)
 
     %__MODULE__{
       tables: tables,
@@ -95,6 +96,19 @@ defmodule Spacetimedbex.Schema do
     case Map.get(tables, table_name) do
       nil -> {:error, {:unknown_table, table_name}}
       table_def -> {:ok, table_def.primary_key}
+    end
+  end
+
+  @doc """
+  Get primary key column names for a table (`[]` if the table has no primary key).
+  """
+  def primary_key_names(%__MODULE__{tables: tables}, table_name) do
+    case Map.get(tables, table_name) do
+      nil ->
+        {:error, {:unknown_table, table_name}}
+
+      %{primary_key: pk, columns: columns} ->
+        {:ok, Enum.map(pk, fn i -> Enum.at(columns, i).name end)}
     end
   end
 
@@ -150,11 +164,11 @@ defmodule Spacetimedbex.Schema do
 
   defp resolve_columns(_, _), do: []
 
-  defp parse_reducers(reducers) when is_list(reducers) do
+  defp parse_reducers(reducers, typespace) when is_list(reducers) do
     Map.new(reducers, fn r ->
       params =
         case r["params"] do
-          %{"elements" => elements} -> Enum.map(elements, &parse_element/1)
+          %{"elements" => elements} -> Enum.map(elements, &parse_param(&1, typespace))
           _ -> []
         end
 
@@ -162,7 +176,12 @@ defmodule Spacetimedbex.Schema do
     end)
   end
 
-  defp parse_reducers(_), do: %{}
+  defp parse_reducers(_, _), do: %{}
+
+  defp parse_param(element, typespace) do
+    col = parse_element(element)
+    %{col | type: resolve_refs(col.type, typespace)}
+  end
 
   defp parse_algebraic_type(%{"Bool" => _}), do: :bool
   defp parse_algebraic_type(%{"U8" => _}), do: :u8
@@ -195,14 +214,19 @@ defmodule Spacetimedbex.Schema do
   end
 
   # Option is encoded as a Sum with two variants: some(T) and none
-  defp parse_algebraic_type(%{"Sum" => %{"variants" => variants}}) when length(variants) == 2 do
-    case variants do
-      [%{"name" => %{"some" => "some"}, "algebraic_type" => inner}, %{"name" => %{"some" => "none"}}] ->
-        {:option, parse_algebraic_type(inner)}
+  defp parse_algebraic_type(%{
+         "Sum" => %{
+           "variants" => [
+             %{"name" => %{"some" => "some"}, "algebraic_type" => inner},
+             %{"name" => %{"some" => "none"}}
+           ]
+         }
+       }) do
+    {:option, parse_algebraic_type(inner)}
+  end
 
-      _ ->
-        {:sum, Enum.map(variants, &parse_element/1)}
-    end
+  defp parse_algebraic_type(%{"Sum" => %{"variants" => variants}}) do
+    {:sum, Enum.map(variants, &parse_element/1)}
   end
 
   defp parse_algebraic_type(%{"Product" => %{"elements" => elements}}) do
@@ -212,18 +236,7 @@ defmodule Spacetimedbex.Schema do
   defp parse_algebraic_type(other), do: {:unknown, other}
 
   # Recursively resolve {:ref, N} types by inlining from the typespace.
-  defp resolve_refs({:ref, idx}, typespace) do
-    case Enum.at(typespace, idx) do
-      {:product, cols} ->
-        {:product, Enum.map(cols, fn c -> %{c | type: resolve_refs(c.type, typespace)} end)}
-
-      {:sum, variants} ->
-        {:sum, Enum.map(variants, fn v -> %{v | type: resolve_refs(v.type, typespace)} end)}
-
-      other ->
-        other
-    end
-  end
+  defp resolve_refs({:ref, idx}, typespace), do: resolve_refs(Enum.at(typespace, idx), typespace)
 
   defp resolve_refs({:array, inner}, typespace), do: {:array, resolve_refs(inner, typespace)}
   defp resolve_refs({:option, inner}, typespace), do: {:option, resolve_refs(inner, typespace)}
@@ -231,6 +244,13 @@ defmodule Spacetimedbex.Schema do
   defp resolve_refs({:product, cols}, typespace) do
     {:product, Enum.map(cols, fn c -> %{c | type: resolve_refs(c.type, typespace)} end)}
   end
+
+  defp resolve_refs({:sum, variants}, typespace) do
+    {:sum, Enum.map(variants, fn v -> %{v | type: resolve_refs(v.type, typespace)} end)}
+  end
+
+  defp resolve_refs({:map, k, v}, typespace),
+    do: {:map, resolve_refs(k, typespace), resolve_refs(v, typespace)}
 
   defp resolve_refs(primitive, _typespace), do: primitive
 

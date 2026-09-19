@@ -205,7 +205,7 @@ defmodule Spacetimedbex.ConnectionTest do
       assert new_state.next_request_id == 2
     end
 
-    test "get_state sends sanitized state to caller" do
+    test "sanitize_state omits the token" do
       state = %Connection{
         host: "localhost:3000",
         database: "test_db",
@@ -216,10 +216,7 @@ defmodule Spacetimedbex.ConnectionTest do
         connection_id: <<2::128>>
       }
 
-      ref = make_ref()
-      assert {:ok, ^state} = Connection.handle_cast({:get_state, self(), ref}, state)
-
-      assert_receive {:spacetimedb_state, ^ref, info}
+      info = Connection.sanitize_state(state)
       assert info.host == "localhost:3000"
       assert info.connected == true
       # Token should not be in sanitized state
@@ -238,9 +235,9 @@ defmodule Spacetimedbex.ConnectionTest do
       }
 
       # Attempt 1 (< 2) should reconnect
-      assert {:reconnect, new_state} =
+      assert {:reconnect, _conn, new_state} =
                Connection.handle_disconnect(
-                 %{reason: :remote, attempt_number: 1},
+                 %{reason: :remote, attempt_number: 1, conn: %WebSockex.Conn{}},
                  state
                )
 
@@ -250,7 +247,7 @@ defmodule Spacetimedbex.ConnectionTest do
       # Attempt 2 (>= 2) should give up
       assert {:ok, _state} =
                Connection.handle_disconnect(
-                 %{reason: :remote, attempt_number: 2},
+                 %{reason: :remote, attempt_number: 2, conn: %WebSockex.Conn{}},
                  state
                )
     end
@@ -272,12 +269,44 @@ defmodule Spacetimedbex.ConnectionTest do
 
       assert {:ok, _state} =
                Connection.handle_disconnect(
-                 %{reason: :remote, attempt_number: 1},
+                 %{reason: :remote, attempt_number: 1, conn: %WebSockex.Conn{}},
                  state
                )
 
       assert_receive {:spacetimedb, {:disconnected, :remote, 1}}
       assert_receive {:spacetimedb, :connection_failed}
+    end
+
+    test "reconnect presents the latest server-issued token" do
+      state = %Connection{
+        host: "localhost:3000",
+        database: "test_db",
+        handler: self(),
+        token: "server-issued",
+        base_backoff_ms: 0
+      }
+
+      old_conn = %WebSockex.Conn{
+        extra_headers: [{"Sec-WebSocket-Protocol", "v2.bsatn.spacetimedb"}]
+      }
+
+      assert {:reconnect, conn, _state} =
+               Connection.handle_disconnect(
+                 %{reason: :remote, attempt_number: 1, conn: old_conn},
+                 state
+               )
+
+      assert {"Authorization", "Bearer server-issued"} in conn.extra_headers
+    end
+
+    test "start_link rejects unsupported compression" do
+      assert {:error, {:unsupported_compression, :brotli}} =
+               Connection.start_link(
+                 host: "localhost:1",
+                 database: "db",
+                 handler: self(),
+                 compression: :brotli
+               )
     end
   end
 

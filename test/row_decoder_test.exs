@@ -151,7 +151,55 @@ defmodule Spacetimedbex.ClientCache.RowDecoderTest do
     test "decodes nested product" do
       inner_columns = [%{name: "a", type: :u8}, %{name: "b", type: :u8}]
       data = <<5, 10>>
-      assert {:ok, %{"a" => 5, "b" => 10}, <<>>} = RowDecoder.decode_value(data, {:product, inner_columns})
+
+      assert {:ok, %{"a" => 5, "b" => 10}, <<>>} =
+               RowDecoder.decode_value(data, {:product, inner_columns})
+    end
+  end
+
+  describe "sum and map types" do
+    @shape {:sum,
+            [
+              %{name: "Circle", type: {:product, [%{name: "r", type: :u32}]}},
+              %{name: "Empty", type: {:product, []}}
+            ]}
+
+    test "decodes a sum variant with payload" do
+      assert {:ok, {"Circle", %{"r" => 7}}, <<>>} =
+               RowDecoder.decode_value(<<0, 7::little-32>>, @shape)
+    end
+
+    test "decodes a unit variant" do
+      assert {:ok, {"Empty", %{}}, <<>>} = RowDecoder.decode_value(<<1>>, @shape)
+    end
+
+    test "rejects an out-of-range variant tag" do
+      assert {:error, {:invalid_sum_tag, 5}} = RowDecoder.decode_value(<<5>>, @shape)
+    end
+
+    test "decodes a ScheduleAt-shaped column inside a row" do
+      schedule_at =
+        {:sum,
+         [
+           %{
+             name: "Interval",
+             type: {:product, [%{name: "__time_duration_micros__", type: :i64}]}
+           },
+           %{
+             name: "Time",
+             type: {:product, [%{name: "__timestamp_micros_since_unix_epoch__", type: :i64}]}
+           }
+         ]}
+
+      columns = [%{name: "id", type: :u64}, %{name: "at", type: schedule_at}]
+
+      assert %{"id" => 1, "at" => {"Time", %{"__timestamp_micros_since_unix_epoch__" => 99}}} =
+               RowDecoder.decode_row(<<1::little-64, 1, 99::little-signed-64>>, columns)
+    end
+
+    test "decodes a map" do
+      data = <<2::little-32, 1, 10::little-32, 2, 20::little-32>>
+      assert {:ok, %{1 => 10, 2 => 20}, <<>>} = RowDecoder.decode_value(data, {:map, :u8, :u32})
     end
   end
 end

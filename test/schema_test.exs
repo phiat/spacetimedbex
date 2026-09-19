@@ -176,7 +176,13 @@ defmodule Spacetimedbex.SchemaTest do
         raw = %{
           "typespace" => %{
             "types" => [
-              %{"Product" => %{"elements" => [%{"name" => %{"some" => "x"}, "algebraic_type" => %{json_key => []}}]}}
+              %{
+                "Product" => %{
+                  "elements" => [
+                    %{"name" => %{"some" => "x"}, "algebraic_type" => %{json_key => []}}
+                  ]
+                }
+              }
             ]
           },
           "tables" => [%{"name" => "t", "product_type_ref" => 0, "primary_key" => [0]}],
@@ -187,6 +193,74 @@ defmodule Spacetimedbex.SchemaTest do
         {:ok, [col]} = Schema.columns_for(schema, "t")
         assert col.type == expected, "Failed for #{json_key}: got #{inspect(col.type)}"
       end
+    end
+  end
+
+  describe "sum types and reducer refs" do
+    @enum_schema %{
+      "typespace" => %{
+        "types" => [
+          %{
+            "Product" => %{
+              "elements" => [
+                %{"name" => %{"some" => "id"}, "algebraic_type" => %{"U32" => []}},
+                %{
+                  "name" => %{"some" => "shape"},
+                  "algebraic_type" => %{
+                    "Sum" => %{
+                      "variants" => [
+                        %{
+                          "name" => %{"some" => "A"},
+                          "algebraic_type" => %{"Product" => %{"elements" => []}}
+                        },
+                        %{
+                          "name" => %{"some" => "B"},
+                          "algebraic_type" => %{"Product" => %{"elements" => []}}
+                        },
+                        %{
+                          "name" => %{"some" => "C"},
+                          "algebraic_type" => %{"Product" => %{"elements" => []}}
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          %{
+            "Product" => %{
+              "elements" => [%{"name" => %{"some" => "x"}, "algebraic_type" => %{"I32" => []}}]
+            }
+          }
+        ]
+      },
+      "tables" => [%{"name" => "log", "product_type_ref" => 0, "primary_key" => []}],
+      "reducers" => [
+        %{
+          "name" => "move",
+          "params" => %{
+            "elements" => [%{"name" => %{"some" => "to"}, "algebraic_type" => %{"Ref" => 1}}]
+          }
+        }
+      ]
+    }
+
+    test "inline sums with more than two variants parse as :sum" do
+      schema = Schema.parse(@enum_schema)
+      {:ok, [_id, shape]} = Schema.columns_for(schema, "log")
+      assert {:sum, [%{name: "A"}, %{name: "B"}, %{name: "C"}]} = shape.type
+    end
+
+    test "reducer params resolve typespace refs" do
+      schema = Schema.parse(@enum_schema)
+
+      assert [%{name: "to", type: {:product, [%{name: "x", type: :i32}]}}] =
+               schema.reducers["move"].params
+    end
+
+    test "primary_key_names is empty for tables without a primary key" do
+      assert {:ok, []} = Schema.primary_key_names(Schema.parse(@enum_schema), "log")
     end
   end
 end

@@ -18,6 +18,28 @@ defmodule Spacetimedbex.CodegenTest do
       assert "my_app/spacetime_db/client.ex" in paths
     end
 
+    test "reducers with camelCase params compile" do
+      schema = %Spacetimedbex.Schema{
+        tables: %{},
+        typespace: [],
+        reducers: %{
+          "setName" => %{
+            name: "setName",
+            params: [%{name: "userName", type: :string}, %{name: "newAge", type: :u32}]
+          }
+        }
+      }
+
+      [{_, source}] =
+        schema
+        |> Codegen.generate("CodegenCompileCheck")
+        |> Enum.filter(fn {path, _} -> path =~ "reducers" end)
+
+      assert source =~ "def set_name(client, user_name, new_age)"
+      assert [{mod, _}] = Code.compile_string(source)
+      assert function_exported?(mod, :set_name, 3)
+    end
+
     test "all generated sources are valid Elixir" do
       files = Codegen.generate(TestSchema.person_schema(), @base_module)
 

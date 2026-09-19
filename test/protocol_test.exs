@@ -3,7 +3,7 @@ defmodule Spacetimedbex.ProtocolTest do
 
   alias Spacetimedbex.BSATN.Encoder
   alias Spacetimedbex.Protocol.ClientMessage
-  alias Spacetimedbex.Protocol.ClientMessage.{Subscribe, Unsubscribe, OneOffQuery, CallReducer}
+  alias Spacetimedbex.Protocol.ClientMessage.{CallReducer, OneOffQuery, Subscribe, Unsubscribe}
   alias Spacetimedbex.Protocol.ServerMessage
 
   describe "ClientMessage encoding" do
@@ -215,7 +215,13 @@ defmodule Spacetimedbex.ProtocolTest do
 
       assert msg.request_id == 10
       assert msg.query_set_id == 20
-      assert [%{table_name: "players", rows: %{size_hint: {:fixed_size, 4}, rows_data: ^row_data}}] = msg.rows
+
+      assert [
+               %{
+                 table_name: "players",
+                 rows: %{size_hint: {:fixed_size, 4}, rows_data: ^row_data}
+               }
+             ] = msg.rows
     end
 
     test "decode TransactionUpdate" do

@@ -61,7 +61,7 @@ defmodule Spacetimedbex.HttpTest do
   # Tag with :integration so they're excluded by default
   # ---------------------------------------------------------------------------
 
-  @host "localhost:3000"
+  @host System.get_env("SPACETIMEDB_HOST", "localhost:3000")
 
   @tag :integration
   test "ping succeeds against live server" do
