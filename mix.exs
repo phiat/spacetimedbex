@@ -4,7 +4,7 @@ defmodule Spacetimedbex.MixProject do
   def project do
     [
       app: :spacetimedbex,
-      version: "0.1.2",
+      version: "0.2.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -40,14 +40,14 @@ defmodule Spacetimedbex.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/phiat/spacetimedbex"},
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "LICENSE"],
+      extras: ["README.md", "CHANGELOG.md", "LICENSE"],
       groups_for_modules: [
         "High-Level API": [
           Spacetimedbex.Client,
@@ -57,7 +57,8 @@ defmodule Spacetimedbex.MixProject do
         "Cache & Schema": [
           Spacetimedbex.ClientCache,
           Spacetimedbex.ClientCache.RowDecoder,
-          Spacetimedbex.Schema
+          Spacetimedbex.Schema,
+          Spacetimedbex.Types
         ],
         "WebSocket Protocol": [
           Spacetimedbex.Connection,
