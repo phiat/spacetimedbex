@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.1 (2026-10-27)
+
+Tested against SpacetimeDB 2.13.0, including the integration suite. No client changes were
+needed: the v2 WebSocket wire format and the HTTP routes this library uses are unchanged
+since 2.10.1. The server's newer additions (`SubscribeBatch`, v3 framing) are not used yet.
+
+### Changed
+
+- Refreshed the lockfile used for development and tests: `mint` 1.10.0 to 1.11.0 (fixes
+  EEF-CVE-2026-91043, rated high, and three medium advisories), `finch` 0.24.0, `req` 0.7.5,
+  `phoenix_pubsub` 2.4.1. `mix hex.audit` is clean. Dependency constraints are unchanged and
+  your app resolves its own versions, so run `mix deps.update mint finch req` there to pick
+  up the Mint fix.
+
+### Notes
+
+- On SpacetimeDB 2.13+, an HTTP reducer call can return `504` when the server cannot confirm
+  durability within five seconds. The outcome is unknown. It surfaces as
+  `{:error, {:http_error, 504, body}}`.
+
 ## v0.2.0 (2026-09-19)
 
 Tested against SpacetimeDB 2.10.1. The v2 WebSocket wire format is unchanged since 2.0.

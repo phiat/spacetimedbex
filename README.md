@@ -31,7 +31,7 @@ Connects to [SpacetimeDB](https://spacetimedb.com) via the v2 BSATN binary WebSo
 # mix.exs
 def deps do
   [
-    {:spacetimedbex, "~> 0.2.0"}
+    {:spacetimedbex, "~> 0.2.1"}
   ]
 end
 ```
@@ -223,7 +223,7 @@ Binary SpacetimeDB Algebraic Type Notation — a compact little-endian binary fo
 
 ### Protocol (v2)
 
-Tested against SpacetimeDB 2.10.1. The v2 wire format is unchanged since 2.0.
+Tested against SpacetimeDB 2.13.0. The v2 wire format is unchanged since 2.0.
 
 Client sends: `Subscribe`, `Unsubscribe`, `OneOffQuery`, `CallReducer`, `CallProcedure`.
 
